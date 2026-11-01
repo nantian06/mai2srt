@@ -423,7 +423,7 @@ def test_the_next_file_uploads_while_the_previous_one_is_segmented(cfg, tmp_path
 
 def test_preparation_runs_at_most_one_file_ahead(cfg, tmp_path, monkeypatch):
     fake = Fake(monkeypatch)
-    fake.delay = 0.1
+    fake.delay = HOLD
     files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abcd"]
     report = b.BatchReport(b.plan_batch(cfg, files))
 
@@ -495,6 +495,20 @@ def test_a_queue_that_only_resegments_never_opens_a_browser_even_with_appends(cf
     assert rep.ok and fake.sessions == 0
 
 
+#: how long a faked upload keeps the queue open while a test appends to or
+#: removes from it: far beyond any timer tick (Windows sleeps in ~15.6 ms
+#: steps, so a margin of a few ms there is a coin toss)
+HOLD = 0.3
+
+
+async def until(cond, timeout=3.0):
+    """Wait for ``cond()`` instead of guessing how long it takes."""
+    end = asyncio.get_running_loop().time() + timeout
+    while not cond():
+        assert asyncio.get_running_loop().time() < end, "condition never held"
+        await asyncio.sleep(0.005)
+
+
 def queue_run(cfg, items, during, **kw):
     """Run a BatchQueue and call ``during(queue)`` while it is running."""
     report = b.BatchReport(items)
@@ -515,7 +529,7 @@ def queue_run(cfg, items, during, **kw):
 
 def test_files_can_be_appended_while_the_queue_runs(cfg, tmp_path, monkeypatch):
     fake = Fake(monkeypatch)
-    fake.delay = 0.05
+    fake.delay = HOLD
     a = touch(tmp_path / "in" / "a.mp3")
     c = touch(tmp_path / "in" / "c.mp3")
     rep, q, added = queue_run(cfg, b.plan_batch(cfg, [a]),
@@ -529,7 +543,7 @@ def test_files_can_be_appended_while_the_queue_runs(cfg, tmp_path, monkeypatch):
 
 def test_an_appended_finished_file_is_skipped_unless_overwritten(cfg, tmp_path, monkeypatch):
     fake = Fake(monkeypatch)
-    fake.delay = 0.05
+    fake.delay = HOLD
     a = touch(tmp_path / "in" / "a.mp3")
     done = touch(tmp_path / "in" / "done.mp3")
     make_project(cfg, done)
@@ -554,14 +568,13 @@ def test_an_appended_finished_file_is_skipped_unless_overwritten(cfg, tmp_path, 
 
 def test_a_failed_file_is_retried_when_added_again(cfg, tmp_path, monkeypatch):
     fake = Fake(monkeypatch)
-    fake.delay = 0.03
+    fake.delay = HOLD                           # slow keeps the queue open
     fake.fail_prepare["bad.mp3"] = MediaError("corrupt")
     bad = touch(tmp_path / "in" / "bad.mp3")
     slow = touch(tmp_path / "in" / "slow.mp3")
 
     async def during(q):
-        await asyncio.sleep(0.01)               # bad has failed by now
-        assert q.report.items[0].status == b.ST_FAILED
+        await until(lambda: q.report.items[0].status == b.ST_FAILED)
         fake.fail_prepare.clear()
         return q.add([bad])
 
@@ -572,7 +585,7 @@ def test_a_failed_file_is_retried_when_added_again(cfg, tmp_path, monkeypatch):
 
 def test_a_waiting_file_can_be_removed_but_a_running_one_cannot(cfg, tmp_path, monkeypatch):
     fake = Fake(monkeypatch)
-    fake.delay = 0.05
+    fake.delay = HOLD
     files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abc"]
 
     def during(q):
@@ -587,7 +600,7 @@ def test_a_waiting_file_can_be_removed_but_a_running_one_cannot(cfg, tmp_path, m
 
 def test_removing_every_waiting_file_lets_the_queue_finish(cfg, tmp_path, monkeypatch):
     fake = Fake(monkeypatch)
-    fake.delay = 0.05
+    fake.delay = HOLD
     files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abcd"]
 
     def during(q):
@@ -603,7 +616,7 @@ def test_removing_every_waiting_file_lets_the_queue_finish(cfg, tmp_path, monkey
 
 def test_appended_same_stem_files_do_not_share_outputs(cfg, tmp_path, monkeypatch):
     fake = Fake(monkeypatch)
-    fake.delay = 0.05
+    fake.delay = HOLD
     a = touch(tmp_path / "x" / "clip.mp3")
     w = touch(tmp_path / "x" / "clip.wav")        # same folder, same stem
     rep, _, _ = queue_run(cfg, b.plan_batch(cfg, [a]), lambda q: q.add([w]))

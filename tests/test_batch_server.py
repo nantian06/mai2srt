@@ -179,7 +179,7 @@ def test_a_second_job_is_refused_while_a_batch_runs(client, tmp_path, monkeypatc
 def test_files_dropped_on_a_running_batch_join_it(client, tmp_path, monkeypatch):
     c, _ = client
     fake = Fake(monkeypatch)
-    fake.delay = 0.2
+    fake.delay = 0.5                 # a request round trip fits in easily
     a = touch(tmp_path / "in" / "a.mp3")
     d = touch(tmp_path / "in" / "d.mp3")
     job_id = start(c, [a])
@@ -207,7 +207,7 @@ def test_files_dropped_on_a_running_batch_join_it(client, tmp_path, monkeypatch)
 def test_a_waiting_file_can_be_taken_out(client, tmp_path, monkeypatch):
     c, _ = client
     fake = Fake(monkeypatch)
-    fake.delay = 0.2
+    fake.delay = 0.5                 # a request round trip fits in easily
     files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abc"]
     job_id = start(c, files)
     time.sleep(0.05)
