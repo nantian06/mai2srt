@@ -23,7 +23,6 @@ from ..config import (
 from ..postprocess import PostprocessParams
 from ..segment import SegmentParams
 from ..media import playback
-from ..media.playback import DIRECT_PLAY_MIMES
 from ..storage import paired_edit_path
 from ..transcribe.persist import load_mai_json
 from .. import storage
@@ -100,10 +99,6 @@ class CacheDelIn(BaseModel):
     files: list[str]
 
 
-#: extensions the WebView2/Chromium <audio> element can actually decode.
-#: Owned by media/playback.py now (the extraction decision and the
-#: binding validation share the same truth); kept as an alias here.
-_AUDIO_MIMES = DIRECT_PLAY_MIMES
 
 
 class AccountIn(BaseModel):
@@ -565,7 +560,10 @@ def create_app(cfg: Config) -> FastAPI:
                 raise HTTPException(415, str(e)) from e
         if not p.is_file():
             raise HTTPException(404, "audio not found: %s" % p)
-        mime = _AUDIO_MIMES.get(p.suffix.lower())
+        # after ensure_playable the file is directly playable here; the
+        # platform's own list is the gate (an AAC file on Linux was turned
+        # into a decodable cache entry above)
+        mime = playback.direct_play_mimes().get(p.suffix.lower())
         if mime is None:
             raise HTTPException(415, "unsupported audio type: %s" % p.suffix)
         size = p.stat().st_size
@@ -617,8 +615,7 @@ def create_app(cfg: Config) -> FastAPI:
             ap = Path(body.audio_path)
             if not ap.is_file():
                 raise HTTPException(400, "audio not found: %s" % ap)
-            if (ap.suffix.lower() not in DIRECT_PLAY_MIMES
-                    and not playback.is_video(ap)):
+            if not playback.is_bindable(ap):
                 raise HTTPException(400,
                                     "unsupported audio type: %s" % ap.suffix)
             set_audio_override(cfg, src, ap)

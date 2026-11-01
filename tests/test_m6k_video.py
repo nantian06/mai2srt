@@ -28,6 +28,18 @@ pytestmark = pytest.mark.skipif(
     ffmpeg is None, reason="ffmpeg not on PATH (fixtures need it)")
 
 
+@pytest.fixture
+def aac_webview(monkeypatch):
+    """Windows/macOS: the webview decodes AAC, so AAC tracks are remuxed."""
+    monkeypatch.setattr(playback, "webview_decodes_aac", lambda: True)
+
+
+@pytest.fixture
+def gstreamer_webview(monkeypatch):
+    """Linux: WebKitGTK + a stock GStreamer has no AAC decoder."""
+    monkeypatch.setattr(playback, "webview_decodes_aac", lambda: False)
+
+
 def _cfg(tmp_path):
     cfg = Config(data_dir=tmp_path / "data")
     cfg.ensure_dirs()
@@ -93,7 +105,7 @@ def test_probe_reads_video_audio_stream(tmp_path):
 
 # --------------------------------------------------------------- extraction
 
-def test_ensure_playable_remuxes_aac_to_m4a(tmp_path):
+def test_ensure_playable_remuxes_aac_to_m4a(tmp_path, aac_webview):
     cfg = _cfg(tmp_path)
     v = _video_with_audio(tmp_path / "clip")
     out = playback.ensure_playable(cfg, v)
@@ -117,6 +129,45 @@ def test_ensure_playable_transcodes_undecodable_codec(tmp_path):
     assert out.suffix == ".mp3"
 
 
+def test_linux_transcodes_aac_instead_of_remuxing(tmp_path, gstreamer_webview):
+    cfg = _cfg(tmp_path)
+    v = _video_with_audio(tmp_path / "clip")
+    out = playback.ensure_playable(cfg, v)
+    assert out.suffix == ".mp3"
+    assert playback.existing_cache(cfg, v) == out
+
+
+def test_linux_ignores_and_replaces_an_old_aac_cache(tmp_path, monkeypatch):
+    """A cache built before the fix holds an .m4a WebKitGTK cannot play: it
+    must not count as a hit, and the playable replacement retires it."""
+    cfg = _cfg(tmp_path)
+    v = _video_with_audio(tmp_path / "clip")
+    monkeypatch.setattr(playback, "webview_decodes_aac", lambda: True)
+    old = playback.ensure_playable(cfg, v)
+    assert old.suffix == ".m4a"
+    monkeypatch.setattr(playback, "webview_decodes_aac", lambda: False)
+    assert playback.existing_cache(cfg, v) is None
+    r = playback.resolve_playable(cfg, None, str(v))
+    assert r["pending"] is True                    # will be re-extracted
+    new = playback.ensure_playable(cfg, v)
+    assert new.suffix == ".mp3"
+    assert not old.exists()
+
+
+def test_linux_extracts_m4a_audio_files_too(tmp_path, gstreamer_webview):
+    cfg = _cfg(tmp_path)
+    a = _lavfi(["-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                "-c:a", "aac"], tmp_path / "voice.m4a")
+    assert playback.needs_extraction(a)
+    assert not playback.needs_extraction(tmp_path / "song.mp3")
+    out = playback.ensure_playable(cfg, a)
+    assert out.suffix == ".mp3" and out != a
+
+
+def test_windows_serves_m4a_audio_files_directly(tmp_path, aac_webview):
+    assert not playback.needs_extraction(tmp_path / "voice.m4a")
+
+
 def test_cache_key_invalidates_on_mtime(tmp_path):
     cfg = _cfg(tmp_path)
     v = _video_with_audio(tmp_path / "clip")
@@ -129,7 +180,7 @@ def test_cache_key_invalidates_on_mtime(tmp_path):
     assert second != first
 
 
-def test_resolve_playable_pending_then_ready(tmp_path):
+def test_resolve_playable_pending_then_ready(tmp_path, aac_webview):
     cfg = _cfg(tmp_path)
     v = _video_with_audio(tmp_path / "clip")
     r = playback.resolve_playable(cfg, None, str(v))
@@ -142,7 +193,7 @@ def test_resolve_playable_pending_then_ready(tmp_path):
 
 # ---------------------------------------------------------------- endpoints
 
-def test_api_audio_serves_video_via_cache(tmp_path):
+def test_api_audio_serves_video_via_cache(tmp_path, aac_webview):
     c = _client(tmp_path)
     v = _video_with_audio(tmp_path / "clip")
     r = c.get("/api/audio", params={"path": str(v)})
@@ -155,7 +206,26 @@ def test_api_audio_serves_video_via_cache(tmp_path):
     assert r2.headers["content-length"] == "10"
 
 
-def test_prepare_endpoint_flips_pending_to_resolved(tmp_path):
+def test_api_audio_serves_an_aac_video_as_mp3_on_linux(tmp_path, gstreamer_webview):
+    c = _client(tmp_path)
+    v = _video_with_audio(tmp_path / "clip")
+    r = c.get("/api/audio", params={"path": str(v)})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/mpeg"
+
+
+def test_binding_accepts_m4a_on_every_platform(tmp_path, gstreamer_webview):
+    c = _client(tmp_path)
+    src = _write_mai_json(tmp_path / "sample.mai.json")
+    a = _lavfi(["-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                "-c:a", "aac"], tmp_path / "voice.m4a")
+    r = c.put("/api/audio_binding",
+              json={"mai_json_path": str(src), "audio_path": str(a)})
+    assert r.status_code == 200
+    assert r.json()["audio"]["pending"] is True    # played through the cache
+
+
+def test_prepare_endpoint_flips_pending_to_resolved(tmp_path, aac_webview):
     c = _client(tmp_path)
     cfg_dir = tmp_path / "data"
     v = _video_with_audio(tmp_path / "clip")
