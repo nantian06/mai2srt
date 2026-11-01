@@ -102,7 +102,7 @@ if [[ "$DEB_DEPENDS" != *ffmpeg* ]]; then
     exit 1
 fi
 DEB_CONTENTS="$(dpkg-deb --contents "${DEB_FILES[0]}")"
-if [[ "$DEB_CONTENTS" != *"mai2srt-backend-$TRIPLE"* ]]; then
+if [[ "$DEB_CONTENTS" != *"mai2srt-backend"* ]]; then
     echo ".deb does not contain the Linux backend sidecar" >&2
     exit 1
 fi
@@ -113,13 +113,27 @@ if [[ ! -x "$DIST_DIR/$(basename "${APPIMAGE_FILES[0]}")" ]]; then
 fi
 EXTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "$EXTRACT_DIR"' EXIT
+DEB_ROOT="$EXTRACT_DIR/deb"
+mkdir -p "$DEB_ROOT"
+dpkg-deb --extract "${DEB_FILES[0]}" "$DEB_ROOT"
+DEB_SIDECAR="$(find "$DEB_ROOT" -type f -name 'mai2srt-backend*' -print -quit)"
+if [[ -z "$DEB_SIDECAR" || ! -x "$DEB_SIDECAR" ]]; then
+    echo ".deb backend sidecar is missing or not executable" >&2
+    exit 1
+fi
+python3 "$ROOT/scripts/smoke-linux-backend.py" "$DEB_SIDECAR"
+APPIMAGE_ROOT="$EXTRACT_DIR/appimage"
+mkdir -p "$APPIMAGE_ROOT"
 (
-    cd "$EXTRACT_DIR"
+    cd "$APPIMAGE_ROOT"
     "${APPIMAGE_FILES[0]}" --appimage-extract >/dev/null
-    test -d squashfs-root
-    SIDECAR_PATH="$(find squashfs-root -type f -name "mai2srt-backend-$TRIPLE" -print -quit)"
-    test -n "$SIDECAR_PATH"
 )
+SIDECAR_PATH="$(find "$APPIMAGE_ROOT/squashfs-root" -type f -name 'mai2srt-backend*' -print -quit)"
+if [[ -z "$SIDECAR_PATH" || ! -x "$SIDECAR_PATH" ]]; then
+    echo "AppImage backend sidecar is missing or not executable" >&2
+    exit 1
+fi
+python3 "$ROOT/scripts/smoke-linux-backend.py" "$SIDECAR_PATH"
 rm -rf "$EXTRACT_DIR"
 trap - EXIT
 
