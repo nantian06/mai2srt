@@ -400,6 +400,8 @@ A：OpenAI 兼容、Anthropic、Gemini 三种格式都能用。同一家换个�
 
 mai2srt 以 [GNU 通用公共许可证第 3 版](./LICENSE) 发布。安装包内的第三方组件保留各自许可证，见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
 
+开发文档：[设计说明](docs/design.md) · [维护日志](docs/changelog.md) · [版本说明](docs/release-notes/v0.2.0.md)。
+
 ---
 
 <div align="center">

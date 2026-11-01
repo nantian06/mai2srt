@@ -403,6 +403,8 @@ This tool was written for personal study and low-frequency use. The playground i
 
 mai2srt is released under the [GNU General Public License v3](./LICENSE). Third-party components bundled in the installer keep their own licenses — see [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md).
 
+Development docs: [Design](docs/design.md) · [Maintenance changelog](docs/changelog.md) · [Release notes](docs/release-notes/v0.2.0.md).
+
 ---
 
 <div align="center">
