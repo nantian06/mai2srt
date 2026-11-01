@@ -302,6 +302,9 @@ export async function createJob(body: {
   overwrite?: boolean;
   /** batch: redo just these files (a skipped row's "re-transcribe") */
   overwrite_paths?: string[];
+  /** batch: files that failed last time; one that now looks done is still
+   *  transcribed again (a failed forced re-transcription) */
+  retry_paths?: string[];
   mai_json_path?: string;
   use_llm?: boolean;
   params?: Record<string, number | boolean>;

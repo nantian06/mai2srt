@@ -65,6 +65,10 @@ class RunIn(BaseModel):
     overwrite: bool = False
     #: batch: redo just these (the row's "re-transcribe" on a skipped file)
     overwrite_paths: list[str] | None = None
+    #: batch: files that failed last time ("retry failed"): one the planner
+    #: would skip is transcribed again -- a failed forced re-transcription
+    #: left its old, current-looking transcript behind
+    retry_paths: list[str] | None = None
     mai_json_path: str | None = None
     use_llm: bool = True
     params: dict = {}
@@ -931,9 +935,12 @@ def create_app(cfg: Config) -> FastAPI:
         sp, pp = _effective_params(body.params)
         items = b.plan_batch(cfg, files, overwrite=body.overwrite)
         force = {b._audio_key(Path(p)) for p in (body.overwrite_paths or [])}
+        retry = {b._audio_key(Path(p)) for p in (body.retry_paths or [])}
         for it in items:
             if b._audio_key(it.audio) in force and it.action != b.ACT_TRANSCRIBE:
                 it.action, it.reason = b.ACT_TRANSCRIBE, "re-transcribe"
+            elif b._audio_key(it.audio) in retry and it.action == b.ACT_SKIP:
+                it.action, it.reason = b.ACT_TRANSCRIBE, "retry"
         report = b.BatchReport(items)
 
         def file_ev(it: b.BatchItem) -> dict:

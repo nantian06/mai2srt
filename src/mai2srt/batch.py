@@ -542,6 +542,11 @@ class BatchQueue:
     def _requeue(self, it: BatchItem, overwrite: bool) -> None:
         project = it.json_path if it.json_path.exists() else None
         it.action, it.reason = _action_for(project, it.srt, overwrite)
+        if it.action == ACT_SKIP and it.status in (ST_FAILED, ST_CANCELLED):
+            # a forced re-transcription that failed before replacing the
+            # transcript leaves the old one looking done: the retry still
+            # owes the upload (a newer transcript re-segments instead)
+            it.action, it.reason = ACT_TRANSCRIBE, "retry"
         it.detail, it.llm_note = "", None
         it.words = it.entries = it.dialogue = 0
         it.seconds = 0.0

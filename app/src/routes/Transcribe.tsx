@@ -67,6 +67,14 @@ function selectionOf(j: TrackedJob): { media: string[]; json: string } {
   return { media: j.meta.audio_path ? [j.meta.audio_path] : [], json: '' };
 }
 
+/** how a start was asked for: the selection, or explicit files to (re)do */
+interface StartOpts {
+  media?: string[];
+  overwrite?: string[];
+  /** failed last time: redo even when they look done */
+  retry?: string[];
+}
+
 /** a row the single-file view still has to show (its reason, its actions) */
 const NEEDS_ROW: BatchFile['status'][] = ['skipped', 'failed', 'cancelled'];
 
@@ -259,8 +267,9 @@ export function TranscribePage() {
     } catch (e) {
       if (e instanceof BatchClosedError) {
         // the queue finished between the drop and the request: the files
-        // were meant to run, so they start a queue of their own
-        await start({ media: paths, overwrite: overwrite ? paths : undefined });
+        // were meant to run, so they start a queue of their own -- once the
+        // page sees the old job settle (this closure still thinks it runs)
+        setPendingStart({ media: paths, overwrite: overwrite ? paths : undefined });
         return;
       }
       toast('error', tf('t.queue.failed', { err: String(e).slice(0, 140) }));
@@ -330,8 +339,18 @@ export function TranscribePage() {
     else if (Array.isArray(p) && p.length > 0) selectPaths(p);
   }
 
+  // files that must start a new queue as soon as the page is free (their
+  // running queue closed under them); started from the render that sees it
+  const [pendingStart, setPendingStart] = useState<StartOpts | null>(null);
+  useEffect(() => {
+    if (!pendingStart || busy) return;
+    const opts = pendingStart;
+    setPendingStart(null);
+    void start(opts);
+  }, [pendingStart, busy]); // eslint-disable-line react-hooks/exhaustive-deps
+
   /** Start the selection (or `opts.media`, e.g. one file to redo). */
-  async function start(opts: { media?: string[]; overwrite?: string[] } = {}) {
+  async function start(opts: StartOpts = {}) {
     if (busy) return;
     const mediaList = opts.media ?? media;
     const jsonPath = opts.media ? '' : json;
@@ -364,6 +383,7 @@ export function TranscribePage() {
           : {
               kind: 'batch', audio_paths: mediaList, use_llm: useLlm,
               ...(opts.overwrite ? { overwrite_paths: opts.overwrite } : {}),
+              ...(opts.retry ? { retry_paths: opts.retry } : {}),
             },
       );
       setJobId(started.id);
@@ -523,7 +543,12 @@ export function TranscribePage() {
               : t('t.action.run')}
           </Button>
           {!busy && (result?.failed ?? 0) > 0 && (
-            <Button variant="ghost" onClick={() => start()}>
+            <Button
+              variant="ghost"
+              onClick={() => start({
+                retry: result?.items?.filter((f) => f.status === 'failed').map((f) => f.audio),
+              })}
+            >
               {t('t.batch.retry')}
             </Button>
           )}

@@ -276,3 +276,14 @@ def test_llm_concurrency_setting_roundtrip_and_use(client, tmp_path, monkeypatch
     job_id = start(c, [touch(tmp_path / "in" / f"{n}.mp3") for n in "abc"])
     assert settle(c, job_id) == "done"
     assert fake.seg_peak == 2
+
+
+def test_retry_redoes_a_failed_file_that_looks_done(client, tmp_path, monkeypatch):
+    c, cfg = client
+    fake = Fake(monkeypatch)
+    one = touch(tmp_path / "in" / "one.mp3")
+    make_project(cfg, one)
+    touch(one.with_suffix(".srt"))
+    job_id = start(c, [one], retry_paths=[str(one)])
+    assert settle(c, job_id) == "done"
+    assert [p.name for p, _ in fake.full] == ["one.mp3"]

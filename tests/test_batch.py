@@ -734,3 +734,27 @@ def test_cli_exits_nonzero_when_an_input_could_not_be_collected(home, tmp_path, 
     assert data["ok"] is False and data["done"] == 1
     assert any("typo.mp3" in m for m in data["input_problems"])
     assert "INPUT NOT PROCESSED" in capsys.readouterr().out
+
+
+def test_a_failed_forced_retranscription_is_retried_not_skipped(cfg, tmp_path, monkeypatch):
+    """Re-transcribing a finished file fails before its transcript is
+    replaced: the old one still looks current, yet adding the file again
+    must redo the upload, not skip it."""
+    fake = Fake(monkeypatch)
+    fake.delay = HOLD
+    done = touch(tmp_path / "in" / "done.mp3")
+    make_project(cfg, done)
+    touch(done.with_suffix(".srt"))
+    slow = touch(tmp_path / "in" / "slow.mp3")
+
+    async def during(q):
+        fake.fail_prepare["done.mp3"] = MediaError("disk full")
+        q.add([done], overwrite=True)
+        await until(lambda: q.report.items[1].status == b.ST_FAILED)
+        fake.fail_prepare.clear()
+        return q.add([done])                      # plain retry, no overwrite
+
+    rep, _, again = queue_run(cfg, b.plan_batch(cfg, [slow]), during)
+    assert again[0].action == b.ACT_TRANSCRIBE
+    assert rep.items[1].status == b.ST_DONE
+    assert [p.name for p, _ in fake.full] == ["slow.mp3", "done.mp3"]
