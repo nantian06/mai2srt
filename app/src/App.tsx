@@ -65,7 +65,10 @@ function Shell() {
     if (!j.live || !TRANSCRIBE_KINDS.includes(j.kind)) return;
     if (j.status === 'done' && j.result) {
       const d = j.result;
-      if (d.items) {
+      // media always runs as a queue now: one file that went through
+      // reads like the classic single run
+      const sole = d.items?.length === 1 && d.items[0].status === 'done' ? d.items[0] : null;
+      if (d.items && !sole) {
         // a batch: the summary replaces the single-file toast, and a failed
         // file makes it a warning (the job itself succeeded)
         toast((d.failed ?? 0) > 0 ? 'warn' : 'ok', tf('t.batch.summary', {
@@ -76,8 +79,9 @@ function Shell() {
       }
       // a partial LLM failure is a quality loss, not a crash: the run
       // succeeded, so warn instead of pretending everything used the model
-      if (d.llm_note) {
-        toast('warn', tf('t.toast.llmDegraded', { err: String(d.llm_note).slice(0, 120) }));
+      const note = sole ? sole.llm_note : d.llm_note;
+      if (note) {
+        toast('warn', tf('t.toast.llmDegraded', { err: String(note).slice(0, 120) }));
       }
     } else if (j.status === 'error') {
       toast('error', (j.lost ? t('k.lost') : j.error).slice(0, 160));

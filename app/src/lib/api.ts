@@ -215,8 +215,14 @@ export interface JobEvent {
   ts: number;
 }
 
+/** Where a running file is in the batch pipeline ('' when not running):
+ *  prepare (ffmpeg) -> upload (playground) -> segment (LLM), with a wait
+ *  between stages while the next stage is busy with another file. */
+export type BatchPhase = '' | 'prepare' | 'wait_upload' | 'upload' | 'wait_segment' | 'segment';
+
 /** One file of a batch job, as the plan/file events report it. */
 export interface BatchFile {
+  /** stable position in the queue (survives removals and appends) */
   index: number;
   total: number;
   audio: string;
@@ -224,8 +230,12 @@ export interface BatchFile {
   json: string;
   /** what the planner chose: upload+segment, re-segment only, or skip */
   action: 'transcribe' | 'resegment' | 'skip';
-  status: 'pending' | 'running' | 'done' | 'skipped' | 'failed' | 'cancelled';
+  /** `removed`: taken out of the running queue (the row disappears) */
+  status: 'pending' | 'running' | 'done' | 'skipped' | 'failed' | 'cancelled' | 'removed';
+  /** absent from servers before the pipeline */
+  phase?: BatchPhase;
   detail: string;
+  words?: number;
   entries: number;
   dialogue: number;
   seconds: number;
@@ -290,6 +300,8 @@ export async function createJob(body: {
   audio_paths?: string[];
   /** batch: redo files that are already finished */
   overwrite?: boolean;
+  /** batch: redo just these files (a skipped row's "re-transcribe") */
+  overwrite_paths?: string[];
   mai_json_path?: string;
   use_llm?: boolean;
   params?: Record<string, number | boolean>;
@@ -303,6 +315,53 @@ export async function createJob(body: {
     throw new Error(await errText(r));
   }
   return (await r.json()).job;
+}
+
+/** The batch already ended (all files settled, or it was aborted): start a
+ *  new one with the files instead. */
+export class BatchClosedError extends Error {}
+
+/** Append files to a running batch (drop-to-queue). Files already waiting or
+ *  running are ignored; with `overwrite` a finished one is redone. */
+export async function appendBatchFiles(
+  jobId: string, paths: string[], overwrite = false,
+): Promise<{ items: BatchFile[]; ignored: number }> {
+  const r = await fetch(`${API_BASE}/api/jobs/${jobId}/files`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ audio_paths: paths, overwrite }),
+  });
+  if (r.status === 409) throw new BatchClosedError(await errText(r));
+  if (!r.ok) throw new Error(await errText(r));
+  return r.json();
+}
+
+/** Take a file that has not started out of a running batch. */
+export async function removeBatchFile(jobId: string, index: number): Promise<void> {
+  const r = await fetch(`${API_BASE}/api/jobs/${jobId}/files/${index}`, { method: "DELETE" });
+  if (!r.ok) throw new Error(await errText(r));
+}
+
+export interface BatchSettings {
+  /** files segmented by the LLM at the same time */
+  llm_jobs: number;
+  max_llm_jobs: number;
+}
+
+export async function getBatchSettings(): Promise<BatchSettings> {
+  const r = await fetch(`${API_BASE}/api/batch/settings`);
+  if (!r.ok) throw new Error(await errText(r));
+  return r.json();
+}
+
+export async function setBatchSettings(llmJobs: number): Promise<BatchSettings> {
+  const r = await fetch(`${API_BASE}/api/batch/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ llm_jobs: llmJobs }),
+  });
+  if (!r.ok) throw new Error(await errText(r));
+  return r.json();
 }
 
 export async function cancelJob(id: string): Promise<void> {

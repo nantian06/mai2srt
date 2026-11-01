@@ -1,17 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
-  Brain, CheckCircle2, Eye, KeyRound, Loader2, Plus, RefreshCw, Server, Trash2,
+  Brain, CheckCircle2, Eye, KeyRound, Layers, Loader2, Plus, RefreshCw, Server, Trash2,
   Zap,
 } from 'lucide-react';
 import {
   Button, Card, ConfirmIconButton, Field, Select, useToast,
 } from '../../components/ui';
 import {
-  llmActive, llmApplyDiscovery, llmDeleteProvider, llmDiscover, llmPresets,
-  llmProviders, llmSaveProvider, llmSetActive, llmTest,
+  getBatchSettings, llmActive, llmApplyDiscovery, llmDeleteProvider, llmDiscover, llmPresets,
+  llmProviders, llmSaveProvider, llmSetActive, llmTest, setBatchSettings,
   warmActive, warmPresets, warmProviders, withBackendRetry,
-  type ActiveLLM, type LlmPreset, type ModelMeta, type Provider,
+  type ActiveLLM, type BatchSettings, type LlmPreset, type ModelMeta, type Provider,
 } from '../../lib/api';
 import { useI18n } from '../../lib/i18n';
 
@@ -57,7 +57,23 @@ export function LlmSettings() {
   const [adding, setAdding] = useState(false);
   // provider chosen in the active-model row (falls back to the active one)
   const [selProviderId, setSelProviderId] = useState<string | null>(null);
+  // how many batch files the LLM segments at once (null until loaded)
+  const [batch, setBatch] = useState<BatchSettings | null>(null);
   const toast = useToast();
+
+  useEffect(() => {
+    withBackendRetry(() => getBatchSettings()).then(setBatch).catch(() => {});
+  }, []);
+
+  async function saveLlmJobs(n: number) {
+    try {
+      const s = await setBatchSettings(n);
+      setBatch(s);
+      toast('ok', tf('s.llmJobs.saved', { n: s.llm_jobs }));
+    } catch (e) {
+      toast('error', String(e).slice(0, 140));
+    }
+  }
 
   const refresh = useCallback(async () => {
     try {
@@ -146,6 +162,25 @@ export function LlmSettings() {
           ]}
         />
       </Card>
+
+      {/* batch pipeline: files segmented at the same time */}
+      {batch && (
+        <Card className="flex flex-wrap items-center gap-4 p-5">
+          <Layers size={16} strokeWidth={2} className="text-primary" />
+          <div className="min-w-0 flex-1">
+            <p className="text-[13px] font-semibold text-ink-1">{t('s.llmJobs')}</p>
+            <p className="mt-0.5 text-[11.5px] text-ink-3">{t('s.llmJobs.hint')}</p>
+          </div>
+          <Select
+            className="w-24"
+            value={String(batch.llm_jobs)}
+            onChange={(v) => saveLlmJobs(Number(v))}
+            options={Array.from({ length: batch.max_llm_jobs }, (_, i) => ({
+              value: String(i + 1), label: String(i + 1),
+            }))}
+          />
+        </Card>
+      )}
 
       {/* providers */}
       <div className="flex items-center justify-between">
