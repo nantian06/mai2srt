@@ -244,6 +244,15 @@ def test_a_failing_file_does_not_stop_the_rest(cfg, tmp_path, monkeypatch):
     assert rep.aborted is None and not rep.ok
 
 
+def test_an_unexpected_exception_is_a_file_failure_not_a_crash(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.fail["a.mp3"] = KeyError("format")
+    files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "ab"]
+    rep = run(cfg, b.plan_batch(cfg, files))
+    assert [i.status for i in rep.items] == [b.ST_FAILED, b.ST_DONE]
+    assert rep.items[0].detail
+
+
 def test_unsigned_session_aborts_before_any_upload(cfg, tmp_path, monkeypatch):
     fake = Fake(monkeypatch, session_error=runner.AuthRequired("not signed in"))
     files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "ab"]

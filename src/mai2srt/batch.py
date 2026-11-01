@@ -31,11 +31,10 @@ from typing import Callable
 
 from . import storage
 from .config import Config, projects_dir
-from .media.probe import MediaError
 from .postprocess import PostprocessParams
 from .segment import SegmentParams
 from .transcribe.browser import NoDisplayError
-from .transcribe.client import BiometricConsentRequired, TranscribeError
+from .transcribe.client import BiometricConsentRequired
 
 log = logging.getLogger("mai2srt.batch")
 
@@ -330,8 +329,9 @@ async def run_batch(
         except (AuthRequired, NoDisplayError) as e:
             item.status, item.detail = ST_FAILED, str(e)
             raise BatchAborted(str(e)) from e
-        except (TranscribeError, MediaError, OSError, ValueError) as e:
-            item.status, item.detail = ST_FAILED, str(e)
+        except Exception as e:  # noqa: BLE001 -- one file's failure, whatever its type
+            item.status = ST_FAILED
+            item.detail = str(e) or type(e).__name__
             # a per-file failure that is really "the session died": probe it
             # (cheap) so the rest of the batch does not fail 40 times over
             if page is not None and item.action == ACT_TRANSCRIBE:
