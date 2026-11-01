@@ -258,6 +258,10 @@ ItemCb = Callable[[int, int, BatchItem], None]
 #: (item, stage, detail) / (item, line)
 ItemStageCb = Callable[[BatchItem, str, str], None]
 ItemLogCb = Callable[[BatchItem, str], None]
+#: (item, RunResult) -- a file just succeeded; the caller may persist extras
+#: (the UI stores the LLM segmentation as a refine record). A failure here is
+#: logged, never the file's failure: its subtitles are already written.
+ResultCb = Callable[[BatchItem, object], None]
 
 
 def _noop(*_a, **_k) -> None:
@@ -278,6 +282,7 @@ async def run_batch(
     on_item_done: ItemCb = _noop,
     on_stage: ItemStageCb = _noop,
     on_log: ItemLogCb = _noop,
+    on_result: ResultCb = _noop,
     on_consent=None,
 ) -> BatchReport:
     """Execute ``report.items`` in place; returns ``report``.
@@ -320,6 +325,10 @@ async def run_batch(
             item.status = ST_DONE
             item.words, item.entries = res.words, res.entries
             item.dialogue, item.llm_note = res.dialogue, res.llm_note
+            try:
+                on_result(item, res)
+            except Exception as e:  # noqa: BLE001
+                log.warning("post-processing %s failed: %s", item.audio.name, e)
         except asyncio.CancelledError:
             item.status = ST_CANCELLED
             raise

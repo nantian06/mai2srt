@@ -50,7 +50,8 @@ def make_project(cfg: Config, audio: Path, name: str | None = None) -> Path:
 
 
 def res(**kw):
-    base = dict(words=10, entries=3, dialogue=0, llm_note=None)
+    base = dict(words=10, entries=3, dialogue=0, llm_note=None,
+                entry_list=None, word_refs=None, json_path=None)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -91,14 +92,14 @@ class Fake:
                     json.dumps({"source": str(audio), "words": []}),
                     encoding="utf-8")
                 kw["srt_path"].write_text("srt", encoding="utf-8")
-                return res()
+                return res(json_path=kw["json_path"])
             finally:
                 fake.live -= 1
 
         async def reseg(cfg, json_path, srt_path, **kw):
             fake.reseg.append(json_path)
             srt_path.write_text("srt", encoding="utf-8")
-            return res(entries=7)
+            return res(entries=7, json_path=json_path)
 
         monkeypatch.setattr(runner, "browser_session", session)
         monkeypatch.setattr(runner, "run_full", run_full)
