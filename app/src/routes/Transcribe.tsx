@@ -1,18 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import {
-  AudioLines, FileAudio, FileJson, FileVideo, FolderOpen, Scissors,
-  SlidersHorizontal, Upload, Wand2,
-} from 'lucide-react';
+import { FileAudio, FileJson, FileVideo, FolderOpen, SlidersHorizontal } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { BatchQueue } from '../components/BatchQueue';
 import { Button, Card, StatusDot, Toggle, useToast } from '../components/ui';
 import { useI18n, type Key } from '../lib/i18n';
 import {
-  cancelJob, createJob, getSubtitleParams, getSystem, preflight, revealPath,
-  subscribeJob, warmParams, warmSystem, withBackendRetry,
-  type BatchFile, type DoneData, type PreflightKey, type SubtitleParams, type SystemInfo,
+  cancelJob, getSubtitleParams, getSystem, preflight, revealPath,
+  warmParams, warmSystem, withBackendRetry,
+  type PreflightKey, type SubtitleParams, type SystemInfo,
 } from '../lib/api';
+import {
+  TRANSCRIBE_KINDS, getJob, startJob, useJob, useJobs, type TrackedJob,
+} from '../lib/jobs';
+import { STAGES } from '../lib/stages';
 import { loadUseLlm, storeUseLlm } from '../lib/subtitle';
 
 /** how a missing prerequisite is named in the refusal toast */
@@ -22,14 +23,6 @@ const PREFLIGHT_LABEL: Record<PreflightKey, Key> = {
   session: 't.pre.session',
   llm: 't.pre.llm',
 };
-
-const STAGES: { id: string; label: Key; icon: typeof FileAudio }[] = [
-  { id: 'prepare', label: 't.stage.prepare', icon: FileAudio },
-  { id: 'upload', label: 't.stage.upload', icon: Upload },
-  { id: 'transcribe', label: 't.stage.transcribe', icon: AudioLines },
-  { id: 'segment', label: 't.stage.segment', icon: Scissors },
-  { id: 'postprocess', label: 't.stage.postprocess', icon: Wand2 },
-];
 
 /** accepted drop/pick inputs (user-approved curated lists; the backend
  *  pipeline itself is container-agnostic -- probe reads the audio stream
@@ -49,37 +42,91 @@ function isVideoPath(p: string): boolean {
   return VIDEO_EXTS.some((e) => p.toLowerCase().endsWith('.' + e));
 }
 
+/**
+ * What the page was showing, kept OUTSIDE the component: switching to another
+ * page unmounts it, and coming back must find the same selection and the job
+ * it started (the job itself lives in the app-wide store, lib/jobs).
+ */
+const draft: { path: string; isJson: boolean; batchPaths: string[]; jobId: string | null } = {
+  path: '', isJson: false, batchPaths: [], jobId: null,
+};
+
+// stable empties: a fresh [] per render would re-fire the log autoscroll
+const NO_FILES: TrackedJob['files'] = [];
+const NO_LOGS: string[] = [];
+
+/** the selection a job was started with (adopting a job this page lost) */
+function selectionOf(j: TrackedJob): { path: string; isJson: boolean; batchPaths: string[] } {
+  if (j.kind === 'batch') return { path: '', isJson: false, batchPaths: j.meta.audio_paths ?? [] };
+  if (j.kind === 'process') return { path: j.meta.mai_json_path ?? '', isJson: true, batchPaths: [] };
+  return { path: j.meta.audio_path ?? '', isJson: false, batchPaths: [] };
+}
+
 export function TranscribePage() {
   const { t, tf } = useI18n();
   // seeded from the startup warm cache: on a hit the status line and the
   // params card are complete on the first frame (their reserved/invisible
   // slots below cover only the cold-cache case)
   const [sys, setSys] = useState<SystemInfo | null>(warmSystem);
-  const [path, setPath] = useState('');
-  const [isJson, setIsJson] = useState(false);
+  const [path, setPath] = useState(draft.path);
+  const [isJson, setIsJson] = useState(draft.isJson);
   // two or more media files = a batch (a single file keeps the classic flow)
-  const [batchPaths, setBatchPaths] = useState<string[]>([]);
-  // the batch job's per-file state (plan event, then one event per change)
-  const [files, setFiles] = useState<BatchFile[]>([]);
+  const [batchPaths, setBatchPaths] = useState<string[]>(draft.batchPaths);
   // shared with the refine workspace (persisted) so both pages agree
   const [useLlm, setUseLlmState] = useState(loadUseLlm);
   const [params, setParams] = useState<SubtitleParams | null>(warmParams);
-  const [jobId, setJobId] = useState<string | null>(null);
+  // the job this page shows; its state (stage, log, batch rows, result) is
+  // read from the app-wide store, which keeps streaming while the page is
+  // unmounted
+  const [jobId, setJobId] = useState<string | null>(draft.jobId);
+  const job = useJob(jobId);
+  const allJobs = useJobs();
   // true from the click until the job exists: instant feedback even before
   // the createJob roundtrip resolves (the click must never feel dead)
   const [starting, setStarting] = useState(false);
-  const [stage, setStage] = useState('');
-  const [logs, setLogs] = useState<string[]>([]);
-  const [result, setResult] = useState<DoneData | null>(null);
-  const [error, setError] = useState('');
+  // a start that failed before any job existed (409 busy, bad path)
+  const [startError, setStartError] = useState('');
   const [dragOver, setDragOver] = useState(false);
   const toast = useToast();
   const logRef = useRef<HTMLDivElement>(null);
-  const disposeRef = useRef<(() => void) | null>(null);
 
-  const running = jobId !== null && !result && !error;
+  const running = job?.status === 'running';
   const busy = starting || running;
   const isBatch = batchPaths.length > 1;
+  // the batch job's per-file state (plan event, then one event per change)
+  const files = job?.files ?? NO_FILES;
+  const stage = job?.stage ?? '';
+  const logs = job?.logs ?? NO_LOGS;
+  const result = job?.status === 'done' ? job.result : null;
+  const error = startError
+    || (job?.status === 'error' ? (job.lost ? t('k.lost') : job.error)
+      : job?.status === 'cancelled' ? t('t.toast.cancelled') : '');
+
+  // write-through: the next mount starts from here
+  useEffect(() => {
+    Object.assign(draft, { path, isJson, batchPaths, jobId });
+  }, [path, isJson, batchPaths, jobId]);
+
+  // a transcription running that this page is not showing (the webview was
+  // reloaded, or the job was started before the draft existed): adopt it,
+  // with the selection it was started with
+  useEffect(() => {
+    if (running || starting) return;
+    const live = allJobs.find((j) => j.status === 'running'
+      && TRANSCRIBE_KINDS.includes(j.kind) && j.id !== jobId);
+    if (!live) return;
+    const sel = selectionOf(live);
+    setPath(sel.path);
+    setIsJson(sel.isJson);
+    setBatchPaths(sel.batchPaths);
+    setStartError('');
+    setJobId(live.id);
+  }, [allJobs, running, starting, jobId]);
+
+  // the run may have refreshed the session/cookie state the status line shows
+  useEffect(() => {
+    if (job?.status === 'done') getSystem().then(setSys).catch(() => {});
+  }, [job?.status]);
 
   const setUseLlm = (v: boolean) => {
     setUseLlmState(v);
@@ -99,7 +146,9 @@ export function TranscribePage() {
     withBackendRetry(() => getSubtitleParams())
       .then(({ params: p }) => { if (alive) setParams(p); })
       .catch(() => { /* the status-line toast above already said it */ });
-    return () => { alive = false; disposeRef.current?.(); };
+    // the job's stream is NOT closed here: it belongs to the store and
+    // keeps running while another page is showing
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {
@@ -108,6 +157,13 @@ export function TranscribePage() {
 
   /** One entry point for drop + browse: decides single vs batch. */
   function selectPaths(paths: string[]) {
+    // one job at a time (the backend's mutex): a new selection would detach
+    // the page from the run it is showing. Read from the draft + store, not
+    // render state: the native drag-drop listener keeps its first closure
+    if (getJob(draft.jobId)?.status === 'running') {
+      toast('warn', t('t.busy.select'));
+      return;
+    }
     const ok = paths.filter((p) => classify(p) !== null);
     if (ok.length === 0) {
       toast('warn', t('t.drop.rejected'));
@@ -131,9 +187,9 @@ export function TranscribePage() {
       setPath(p);
       setBatchPaths([]);
     }
-    setFiles([]);
-    setResult(null);
-    setError('');
+    // a finished job stays in the task monitor; the page moves on
+    setJobId(null);
+    setStartError('');
   }
 
   function removeFromQueue(p: string) {
@@ -199,58 +255,20 @@ export function TranscribePage() {
         }));
         return;
       }
-      setError('');
-      setResult(null);
-      setLogs([]);
-      setStage('');
-      setFiles([]);
-      const job = await createJob(
+      setStartError('');
+      // completion toasts come from the app shell (lib/jobs settle hook),
+      // so they still fire when the job ends on another page
+      const started = await startJob(
         isBatch
           ? { kind: 'batch', audio_paths: batchPaths, use_llm: useLlm }
           : isJson
             ? { kind: 'process', mai_json_path: path, use_llm: useLlm }
             : { kind: 'run', audio_path: path, use_llm: useLlm },
       );
-      setJobId(job.id);
-      disposeRef.current = subscribeJob(job.id, {
-        onPlan: (items) => setFiles(items),
-        onFile: (f) => setFiles((fs) => fs.map((x) => (x.index === f.index ? f : x))),
-        onStage: (s) => setStage(s),
-        onLog: (line) => setLogs((ls) => [...ls.slice(-500), line]),
-        onDone: (d) => {
-          setResult(d);
-          if (d.items) {
-            // a batch: the summary replaces the single-file toast, and a
-            // failed file makes it a warning (the job itself succeeded)
-            setFiles(d.items);
-            toast((d.failed ?? 0) > 0 ? 'warn' : 'ok', tf('t.batch.summary', {
-              done: d.done ?? 0, skipped: d.skipped ?? 0, failed: d.failed ?? 0,
-            }));
-          } else {
-            toast('ok', t('t.toast.done'));
-          }
-          // a partial LLM failure is a quality loss, not a crash: the run
-          // succeeded, so warn instead of pretending everything used the model
-          if (d.llm_note) {
-            toast('warn', tf('t.toast.llmDegraded', { err: String(d.llm_note).slice(0, 120) }));
-          }
-          getSystem().then(setSys).catch(() => {});
-        },
-        onError: (m) => {
-          setError(m);
-          toast('error', m.slice(0, 160));
-        },
-        onCancelled: () => {
-          setError(t('t.toast.cancelled'));
-          // the server's terminal event closes the stream before the batch
-          // can report the files it stopped, so settle those rows here
-          setFiles((fs) => fs.map((f) => (
-            f.status === 'running' || f.status === 'pending'
-              ? { ...f, status: 'cancelled' as const } : f)));
-        },
-      });
+      setJobId(started.id);
     } catch (e) {
-      setError(String(e));
+      setJobId(null);
+      setStartError(String(e));
     } finally {
       setStarting(false);
     }
@@ -297,13 +315,7 @@ export function TranscribePage() {
           e.preventDefault();
           setDragOver(false);
           const f = e.dataTransfer.files[0];
-          if (!f) return;
-          if (classify(f.name) === null) {
-            toast('warn', t('t.drop.rejected'));
-            return;
-          }
-          setIsJson(classify(f.name) === 'json');
-          setPath(f.name);
+          if (f) selectPaths([f.name]);
         }}
         className="relative"
       >

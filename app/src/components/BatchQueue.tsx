@@ -1,4 +1,6 @@
-import { CheckCircle2, CircleDashed, Loader2, MinusCircle, X, XCircle } from 'lucide-react';
+import {
+  CheckCircle2, CircleDashed, FolderOpen, Loader2, MinusCircle, SlidersHorizontal, X, XCircle,
+} from 'lucide-react';
 import { Card } from './ui';
 import { useI18n, type Key } from '../lib/i18n';
 import type { BatchFile } from '../lib/api';
@@ -30,13 +32,21 @@ const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p;
  * - `files` (the server's plan, then its per-file events): live statuses;
  * - `selected` (plain paths, before anything started): removable rows.
  * Order is the run order; the queue is serial, so there is no reordering.
+ *
+ * The task monitor adds per-file actions on finished rows (`onRefine`,
+ * `onReveal`), the running file's stage (`runningNote`) and drops the card
+ * chrome (`bare`) because it already sits inside one.
  */
 export function BatchQueue({
-  files, selected, onRemove,
+  files, selected, onRemove, onRefine, onReveal, runningNote, bare = false,
 }: {
   files: BatchFile[];
   selected: string[];
   onRemove?: (path: string) => void;
+  onRefine?: (file: BatchFile) => void;
+  onReveal?: (file: BatchFile) => void;
+  runningNote?: string;
+  bare?: boolean;
 }) {
   const { t, tf } = useI18n();
   const live = files.length > 0;
@@ -46,13 +56,14 @@ export function BatchQueue({
         note: f.action === 'resegment' && f.status !== 'skipped' ? t('t.batch.act.resegment') : '',
         lines: f.status === 'done' ? tf('t.batch.lines', { n: f.entries }) : '',
         fallback: !!f.llm_note,
+        file: f as BatchFile | null,
       }))
     : selected.map((p) => ({
         key: p, path: p, status: 'pending' as const, detail: '', note: '', lines: '', fallback: false,
+        file: null as BatchFile | null,
       }));
 
-  return (
-    <Card className="max-h-72 overflow-y-auto p-2">
+  const list = (
       <ul className="flex flex-col">
         {rows.map((r) => (
           <li
@@ -70,10 +81,35 @@ export function BatchQueue({
               )}
             </span>
             {r.note && <span className="shrink-0 text-[11px] text-ink-3">{r.note}</span>}
+            {r.status === 'running' && runningNote && (
+              <span className="shrink-0 text-[11px] text-primary">{runningNote}</span>
+            )}
             {r.fallback && (
               <span className="shrink-0 text-[11px] text-warn">{tf('t.batch.fallback', { n: 1 })}</span>
             )}
             {r.lines && <span className="shrink-0 text-[11px] text-ink-3">{r.lines}</span>}
+            {r.file && (r.status === 'done' || r.status === 'skipped') && (onRefine || onReveal) && (
+              <span className="flex shrink-0 items-center gap-2">
+                {onRefine && (
+                  <button
+                    className="text-ink-3 transition-colors hover:text-primary"
+                    onClick={() => onRefine(r.file!)}
+                    title={t('t.result.toRefine')}
+                  >
+                    <SlidersHorizontal size={13} strokeWidth={2} />
+                  </button>
+                )}
+                {onReveal && (
+                  <button
+                    className="text-ink-3 transition-colors hover:text-primary"
+                    onClick={() => onReveal(r.file!)}
+                    title={t('t.hint.reveal')}
+                  >
+                    <FolderOpen size={13} strokeWidth={2} />
+                  </button>
+                )}
+              </span>
+            )}
             {live ? (
               <span className="w-24 shrink-0 text-right text-[11px] text-ink-2">
                 {t(STATUS_LABEL[r.status])}
@@ -92,6 +128,9 @@ export function BatchQueue({
           </li>
         ))}
       </ul>
-    </Card>
   );
+
+  return bare
+    ? <div className="max-h-72 overflow-y-auto">{list}</div>
+    : <Card className="max-h-72 overflow-y-auto p-2">{list}</Card>;
 }

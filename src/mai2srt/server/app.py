@@ -426,7 +426,9 @@ def create_app(cfg: Config) -> FastAPI:
                 audio = Path(body.audio_path or "")
                 if not audio.exists():
                     raise HTTPException(400, "audio not found: %s" % audio)
-                job = await manager.start("run", audio.name, lambda j: _run_job(cfg, j, body))
+                job = await manager.start(
+                    "run", audio.name, lambda j: _run_job(cfg, j, body),
+                    meta={"audio_path": str(audio), "use_llm": body.use_llm})
             elif body.kind == "batch":
                 from ..batch import collect_inputs
                 files, problems = collect_inputs(body.audio_paths or [])
@@ -434,12 +436,16 @@ def create_app(cfg: Config) -> FastAPI:
                     raise HTTPException(400, "; ".join(problems) or "no input files")
                 job = await manager.start(
                     "batch", "%d files" % len(files),
-                    lambda j: _batch_job(cfg, j, body, files))
+                    lambda j: _batch_job(cfg, j, body, files),
+                    meta={"audio_paths": [str(f) for f in files],
+                          "use_llm": body.use_llm})
             elif body.kind == "process":
                 src = Path(body.mai_json_path or "")
                 if not src.exists():
                     raise HTTPException(400, "mai.json not found: %s" % src)
-                job = await manager.start("process", src.name, lambda j: _process_job(cfg, j, body))
+                job = await manager.start(
+                    "process", src.name, lambda j: _process_job(cfg, j, body),
+                    meta={"mai_json_path": str(src), "use_llm": body.use_llm})
             elif body.kind == "login":
                 from ..runner import login_flow
                 job = await manager.start(
@@ -457,13 +463,19 @@ def create_app(cfg: Config) -> FastAPI:
                 raise HTTPException(400, "unknown kind: %s" % body.kind)
         except BusyError as e:
             raise HTTPException(409, str(e)) from e
-        return {"job": {"id": job.id, "kind": job.kind, "title": job.title,
-                        "status": job.status}}
+        return {"job": job.summary()}
 
     @app.get("/api/jobs")
     def list_jobs() -> dict:
-        return {"jobs": [{"id": j.id, "kind": j.kind, "title": j.title,
-                          "status": j.status} for j in manager.list()]}
+        return {"jobs": [j.summary() for j in manager.list()]}
+
+    @app.delete("/api/jobs/{job_id}")
+    def forget_job(job_id: str) -> dict:
+        if not manager.get(job_id):
+            raise HTTPException(404, "job not found")
+        if not manager.forget(job_id):
+            raise HTTPException(409, "job still running")
+        return {"ok": True}
 
     @app.get("/api/jobs/{job_id}/events")
     async def job_events(job_id: str, from_idx: int = 0):

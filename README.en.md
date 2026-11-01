@@ -158,6 +158,8 @@ FFmpeg is bundled with the installer — you do **not** need to install it yours
 
 **Several files at once:** drop or pick more than one audio/video file and the page turns into a queue — remove files you do not want, press "transcribe N files", and each row shows its own status (waiting / running / done / skipped / failed, with the reason for a failure). Files that already have a transcript and subtitles are skipped, so after a failure "retry failed" simply runs the batch again. A batch uses one browser session and goes through the files one at a time; the command-line equivalent is [`mai2srt batch`](#batch-transcription).
 
+**Task monitor:** the "Tasks" page in the sidebar lists every background task of this session (transcriptions, batches, sign-ins): the live stage and a progress bar, each batch file's status, the full log and the elapsed time. Cancel a running task there, open a result's folder, or send a single file straight to refine. Tasks no longer belong to the Transcribe page: switch to another page and back, or even reload the UI, and a running task is still shown; when it ends you get a notice whichever page is open. The number next to "Tasks" is how many are running.
+
 If you drop a `.mai.json` instead of media, the button becomes "generate subtitles": transcription is skipped and only the segmentation runs again. That spends no transcription quota and is the right path for tuning.
 
 | Shortcut | Action |

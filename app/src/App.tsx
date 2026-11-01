@@ -1,21 +1,24 @@
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
-  AudioLines, Brain, ChevronDown, FolderOpen, Palette, Settings2, SlidersHorizontal,
+  AudioLines, Brain, ChevronDown, FolderOpen, ListChecks, Palette, Settings2, SlidersHorizontal,
 } from 'lucide-react';
 import { TitleBar } from './components/TitleBar';
-import { ToastHost } from './components/ui';
+import { ToastHost, useToast } from './components/ui';
 import { primeWarm, getSystem, warmSystem, withBackendRetry } from './lib/api';
+import { TRANSCRIBE_KINDS, discoverJobs, onJobSettled, useJobs } from './lib/jobs';
 import { AppearanceProvider, WallpaperLayer, useAppearance } from './lib/appearance';
 import { I18nProvider, useI18n, type Key } from './lib/i18n';
 import { TranscribePage } from './routes/Transcribe';
 import { RefinePage } from './routes/Refine';
+import { TasksPage } from './routes/Tasks';
 import { AppearanceSettings } from './routes/settings/Appearance';
 import { FilesSettings } from './routes/settings/Files';
 import { LlmSettings } from './routes/settings/Llm';
 
 type SettingsSection = 'settings/appearance' | 'settings/files' | 'settings/llm';
-type Page = 'transcribe' | 'refine' | SettingsSection;
+type Page = 'transcribe' | 'refine' | 'tasks' | SettingsSection;
+const TOP_PAGES = ['transcribe', 'refine', 'tasks'] as const;
 
 const SETTINGS_SECTIONS: { id: SettingsSection; label: Key; icon: typeof Palette }[] = [
   { id: 'settings/appearance', label: 'nav.appearance', icon: Palette },
@@ -36,7 +39,9 @@ function Shell() {
   // mount the appearance effects once at the shell root (provider applies
   // theme CSS vars + exposes the wallpaper layer data)
   const appearance = useAppearance();
-  const { t } = useI18n();
+  const { t, tf } = useI18n();
+  const toast = useToast();
+  const runningJobs = useJobs().filter((j) => j.status === 'running').length;
 
   const go = (p: Page) => {
     if (isSettings(p)) lastSection.current = p;
@@ -48,6 +53,36 @@ function Shell() {
   // state from the cache and paint COMPLETE on their first frame (no
   // components materializing inside the slide-in)
   useEffect(() => { primeWarm(); }, []);
+
+  // jobs outlive pages: re-attach to whatever the backend is running (a
+  // reloaded webview finds its batch again), retried while the sidecar boots
+  useEffect(() => { withBackendRetry(discoverJobs, 12, 800).catch(() => {}); }, []);
+
+  // completion notices live here, not on the page that started the job:
+  // a run that ends while another page is showing still reports. Sign-in
+  // and consent jobs keep their own (richer) toasts on the settings page.
+  useEffect(() => onJobSettled((j) => {
+    if (!j.live || !TRANSCRIBE_KINDS.includes(j.kind)) return;
+    if (j.status === 'done' && j.result) {
+      const d = j.result;
+      if (d.items) {
+        // a batch: the summary replaces the single-file toast, and a failed
+        // file makes it a warning (the job itself succeeded)
+        toast((d.failed ?? 0) > 0 ? 'warn' : 'ok', tf('t.batch.summary', {
+          done: d.done ?? 0, skipped: d.skipped ?? 0, failed: d.failed ?? 0,
+        }));
+      } else {
+        toast('ok', t('t.toast.done'));
+      }
+      // a partial LLM failure is a quality loss, not a crash: the run
+      // succeeded, so warn instead of pretending everything used the model
+      if (d.llm_note) {
+        toast('warn', tf('t.toast.llmDegraded', { err: String(d.llm_note).slice(0, 120) }));
+      }
+    } else if (j.status === 'error') {
+      toast('error', (j.lost ? t('k.lost') : j.error).slice(0, 160));
+    }
+  }), [t, tf, toast]);
 
   // The shell runs inside a webview, whose own shortcuts mean nothing here and
   // surface as browser UI on top of the app: Ctrl+S opens the webview's "save
@@ -92,7 +127,7 @@ function Shell() {
   useEffect(() => {
     const onNav = (e: Event) => {
       const p = (e as CustomEvent<string>).detail;
-      if (p === 'transcribe' || p === 'refine'
+      if ((TOP_PAGES as readonly string[]).includes(p)
           || SETTINGS_SECTIONS.some((s) => s.id === p)) go(p as Page);
     };
     window.addEventListener('mai2srt:nav', onNav);
@@ -116,7 +151,8 @@ function Shell() {
         {/* side nav */}
         <nav className="glass-nav flex w-[188px] shrink-0 flex-col gap-1 border-r border-line-1 p-3">
           {([['transcribe', 'nav.transcribe', AudioLines],
-             ['refine', 'nav.refine', SlidersHorizontal]] as const).map(
+             ['refine', 'nav.refine', SlidersHorizontal],
+             ['tasks', 'nav.tasks', ListChecks]] as const).map(
             ([id, label, Icon]) => {
               const active = page === id;
               return (
@@ -136,6 +172,13 @@ function Shell() {
                   )}
                   <Icon size={16} strokeWidth={2} className="relative z-10" />
                   <span className="relative z-10">{t(label)}</span>
+                  {/* the monitor's badge: how many jobs are running now */}
+                  {id === 'tasks' && runningJobs > 0 && (
+                    <span className="relative z-10 ml-auto flex items-center gap-1.5 text-[11px] font-semibold text-primary">
+                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
+                      {runningJobs}
+                    </span>
+                  )}
                 </button>
               );
             },
@@ -235,6 +278,7 @@ function Shell() {
             >
               {page === 'transcribe' && <TranscribePage />}
               {page === 'refine' && <RefinePage />}
+              {page === 'tasks' && <TasksPage />}
               {page === 'settings/appearance' && <AppearanceSettings />}
               {page === 'settings/files' && <FilesSettings />}
               {page === 'settings/llm' && <LlmSettings />}
