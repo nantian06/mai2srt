@@ -71,6 +71,12 @@ def test_find_channel_exe_skips_snap_chromium(monkeypatch, tmp_path):
     assert br.find_channel_exe("chromium-system") is None
 
 
+def test_snap_detection_ignores_the_path_separator(monkeypatch):
+    # Windows' realpath uses backslashes; the check must not depend on "/"
+    monkeypatch.setattr(br.os.path, "realpath", lambda p: "C:\\snap\\bin\\chromium")
+    assert br._is_snap("/snap/bin/chromium") is True
+
+
 def test_ubuntu_launcher_shim_for_the_snap_is_skipped(monkeypatch, tmp_path):
     shim = tmp_path / "chromium-browser"
     shim.write_text("#!/bin/sh\nexec /snap/bin/chromium \"$@\"\n", encoding="utf-8")

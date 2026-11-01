@@ -84,7 +84,7 @@ def _is_snap(path: str) -> bool:
     driving it fails in confusing ways.
     """
     try:
-        if "/snap/" in os.path.realpath(path):
+        if "/snap/" in os.path.realpath(path).replace("\\", "/"):
             return True
         p = Path(path)
         return p.stat().st_size < 8192 and b"/snap/" in p.read_bytes()
