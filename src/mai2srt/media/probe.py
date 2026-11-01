@@ -107,13 +107,54 @@ def no_window() -> dict:
     return {"creationflags": subprocess.CREATE_NO_WINDOW, "startupinfo": si}
 
 
+def child_env() -> dict[str, str] | None:
+    """Environment for a tool we spawn, minus the app's own library directory.
+
+    PyInstaller's bootloader exports the bundle's ``_internal`` directory in
+    ``LD_LIBRARY_PATH`` and every child inherits it. The ``libstdc++`` shipped in
+    ``_internal`` is the one the build machine had, which is older than the one on
+    a current distro, so a PATH-resolved ffmpeg/ffprobe loads the bundled copy and
+    dies on a symbol some *system* library needs:
+
+        ffprobe: .../_internal/libstdc++.so.6: version `GLIBCXX_3.4.32' not found
+                 (required by /lib/x86_64-linux-gnu/libsrt-gnutls.so.1.5)
+
+    The sidecar itself needs that path to load its own bundled libraries, so it is
+    cleaned per child rather than removed from ``os.environ``. Only our bundle
+    entry is dropped; anything else the user set survives. ``None`` means inherit.
+    """
+    if sys.platform == "win32":
+        return None
+    bundle = getattr(sys, "_MEIPASS", None)
+    value = os.environ.get("LD_LIBRARY_PATH")
+    if not bundle or not value:
+        return None
+    bundle = os.path.normpath(str(bundle))
+    entries = [p for p in value.split(os.pathsep) if p]
+    kept = [p for p in entries if os.path.normpath(p) != bundle]
+    if len(kept) == len(entries):
+        return None
+    env = dict(os.environ)
+    if kept:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(kept)
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
 def run_tool(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    """subprocess.run for ffmpeg/ffprobe, with the console window suppressed.
+    """subprocess.run for ffmpeg/ffprobe, with the console window suppressed and
+    the bundle's library path kept out of the child.
 
     Every media call has to go through here: one that does not will flash a
     console window in the packaged app and nowhere else, so it survives every
-    dev test.
+    dev test. The same is true of the library path -- a direct spawn inherits
+    ``_internal``, and only a packaged app on a newer distro than the build
+    machine fails.
     """
+    env = child_env()
+    if env is not None:
+        kwargs.setdefault("env", env)
     return subprocess.run(cmd, **no_window(), **kwargs)
 
 
