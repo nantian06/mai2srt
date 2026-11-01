@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,9 +63,23 @@ class RunIn(BaseModel):
     audio_paths: list[str] | None = None
     #: batch: redo files that already have a transcript + subtitles
     overwrite: bool = False
+    #: batch: redo just these (the row's "re-transcribe" on a skipped file)
+    overwrite_paths: list[str] | None = None
     mai_json_path: str | None = None
     use_llm: bool = True
     params: dict = {}
+
+
+class FilesIn(BaseModel):
+    """Files appended to a running batch."""
+    audio_paths: list[str]
+    #: re-transcribe even when the file is already done (or in the queue
+    #: and settled)
+    overwrite: bool = False
+
+
+class BatchSettingsIn(BaseModel):
+    llm_jobs: int
 
 
 class PreviewIn(BaseModel):
@@ -149,6 +164,14 @@ def entry_records(words_sorted: list, entries: list) -> list[dict]:
             "text": e.text, "dialogue": e.is_dialogue,
         })
     return out
+
+
+def _batch_title(files) -> str:
+    """A batch's job title: the file's name alone, else the count."""
+    files = list(files)
+    if len(files) == 1:
+        return Path(files[0]).name
+    return "%d files" % len(files)
 
 
 #: Any local page may talk to this API. A HARDCODED port here is a trap: the
@@ -430,7 +453,7 @@ def create_app(cfg: Config) -> FastAPI:
                 if problems or not files:
                     raise HTTPException(400, "; ".join(problems) or "no input files")
                 job = await manager.start(
-                    "batch", "%d files" % len(files),
+                    "batch", _batch_title(files),
                     lambda j: _batch_job(cfg, j, body, files),
                     meta={"audio_paths": [str(f) for f in files],
                           "use_llm": body.use_llm})
@@ -492,6 +515,68 @@ def create_app(cfg: Config) -> FastAPI:
         if not manager.cancel(job_id):
             raise HTTPException(409, "job not cancellable")
         return {"ok": True}
+
+    def _running_batch(job_id: str):
+        """(job, BatchQueue, file-event formatter) of a running batch."""
+        job = manager.get(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        ctl = job.control
+        if job.kind != "batch" or job.status != "running" or ctl is None:
+            raise HTTPException(409, "not a running batch")
+        return job, ctl.queue, ctl.file_ev
+
+    # async: the queue lives on the event loop, so its add/remove must run
+    # there too (a sync endpoint would call it from a threadpool worker)
+    @app.post("/api/jobs/{job_id}/files")
+    async def batch_add(job_id: str, body: FilesIn) -> dict:
+        """Append files to a running batch (drop-to-queue).
+
+        409 once the batch has closed (every file settled, or it was
+        aborted): the client then starts a new batch with these files.
+        """
+        from ..batch import collect_inputs
+        job, queue, ev = _running_batch(job_id)
+        files, problems = collect_inputs(body.audio_paths)
+        if not files:
+            raise HTTPException(400, "; ".join(problems) or "no input files")
+        added = queue.add(files, overwrite=body.overwrite)
+        if added is None:
+            raise HTTPException(409, "batch has finished")
+        for it in added:
+            manager.emit(job, "file", ev(it))
+        paths = [str(i.audio) for i in queue.report.items]
+        job.meta["audio_paths"] = paths
+        job.title = _batch_title(paths)
+        return {"items": [ev(it) for it in added],
+                "ignored": len(files) - len(added),
+                "problems": problems}
+
+    @app.delete("/api/jobs/{job_id}/files/{index}")
+    async def batch_remove(job_id: str, index: int) -> dict:
+        """Take a file that has not started out of a running batch."""
+        job, queue, ev = _running_batch(job_id)
+        it = queue.remove(index)
+        if it is None:
+            raise HTTPException(409, "file already started or not in the batch")
+        manager.emit(job, "file", ev(it))
+        paths = [str(i.audio) for i in queue.report.items]
+        job.meta["audio_paths"] = paths
+        job.title = _batch_title(paths)
+        return {"ok": True}
+
+    @app.get("/api/batch/settings")
+    def batch_settings() -> dict:
+        from ..config import MAX_LLM_JOBS, llm_jobs
+        return {"llm_jobs": llm_jobs(cfg), "max_llm_jobs": MAX_LLM_JOBS}
+
+    @app.put("/api/batch/settings")
+    def batch_settings_put(body: BatchSettingsIn) -> dict:
+        from ..config import MAX_LLM_JOBS, set_llm_jobs
+        if not 1 <= body.llm_jobs <= MAX_LLM_JOBS:
+            raise HTTPException(400, "llm_jobs must be 1..%d" % MAX_LLM_JOBS)
+        return {"llm_jobs": set_llm_jobs(cfg, body.llm_jobs),
+                "max_llm_jobs": MAX_LLM_JOBS}
 
     # ---------------------------------------------------------------- files
 
@@ -800,53 +885,65 @@ def create_app(cfg: Config) -> FastAPI:
             if stale.exists():
                 stale.unlink()
 
-        # video / exotic-audio source: prewarm the playback extraction in
-        # the background so the usual "transcribe -> refine -> play" path
-        # is instant. Fire-and-forget: playback is a convenience, never a
-        # failure of the (already successful) job.
-        if playback.needs_extraction(audio):
-            async def _prewarm() -> None:
-                try:
-                    await asyncio.to_thread(
-                        playback.ensure_playable, cfg, audio)
-                    manager.emit(job, "log", {
-                        "line": "音频轨已提取缓存，精修页可直接播放"})
-                except Exception as e:  # noqa: BLE001
-                    manager.emit(job, "log", {
-                        "line": "音频提取预热失败（不影响转录）：%s" % e})
-            asyncio.create_task(_prewarm())
+        _prewarm_playback(job, audio)
         return {"srt_path": str(res.srt_path), "json_path": str(res.json_path),
                 "words": res.words, "entries": res.entries, "dialogue": res.dialogue,
                 "llm_note": res.llm_note}
 
+    # one extraction at a time: a batch finishing many videos must not start
+    # an ffmpeg per file on top of its own preparation work
+    prewarm_gate: list[asyncio.Semaphore] = []
+
+    def _prewarm_playback(job: Job, audio: Path, prefix: str = "") -> None:
+        """Video / exotic-audio source: build the playback cache in the
+        background, so the usual "transcribe -> refine -> play" path is
+        instant. Fire-and-forget: playback is a convenience, never a failure
+        of the (already successful) transcription."""
+        if not playback.needs_extraction(audio):
+            return
+        if not prewarm_gate:
+            prewarm_gate.append(asyncio.Semaphore(1))
+
+        async def _prewarm() -> None:
+            async with prewarm_gate[0]:
+                try:
+                    await asyncio.to_thread(playback.ensure_playable, cfg, audio)
+                    manager.emit(job, "log", {
+                        "line": prefix + "音频轨已提取缓存，精修页可直接播放"})
+                except Exception as e:  # noqa: BLE001
+                    manager.emit(job, "log", {
+                        "line": prefix + "音频提取预热失败（不影响转录）：%s" % e})
+        asyncio.create_task(_prewarm())
+
     async def _batch_job(cfg: Config, job: Job, body: RunIn, files: list[Path]) -> dict:
-        """Many files, one browser session (see mai2srt.batch).
+        """Many files, one browser session, run as a pipeline (mai2srt.batch).
 
         Events on top of the usual stage/log: ``plan`` once (every file with
-        the action the planner chose) and ``file`` whenever one settles. A
-        file's failure is a ``file`` event, not a job error; only a global
-        problem (sign-in, 451, no browser) ends the job in error.
+        the action the planner chose) and ``file`` whenever one changes --
+        it starts, moves to another pipeline phase, settles, is appended
+        (an index the client has not seen yet) or removed (status
+        ``removed``). A file's failure is a ``file`` event, not a job error;
+        only a global problem (sign-in, 451, no browser) ends the job in
+        error. The queue stays open for appends until every file settled.
         """
         from .. import batch as b
+        from ..config import llm_jobs
         sp, pp = _effective_params(body.params)
         items = b.plan_batch(cfg, files, overwrite=body.overwrite)
+        force = {b._audio_key(Path(p)) for p in (body.overwrite_paths or [])}
+        for it in items:
+            if b._audio_key(it.audio) in force and it.action != b.ACT_TRANSCRIBE:
+                it.action, it.reason = b.ACT_TRANSCRIBE, "re-transcribe"
         report = b.BatchReport(items)
-        total = len(items)
-        index = {id(it): n for n, it in enumerate(items)}
 
         def file_ev(it: b.BatchItem) -> dict:
-            return {"index": index[id(it)], "total": total, "audio": str(it.audio),
-                    "srt": str(it.srt), "json": str(it.json_path),
-                    "action": it.action, "status": it.status, "detail": it.detail,
+            return {"index": it.index, "total": len(report.items),
+                    "audio": str(it.audio), "srt": str(it.srt),
+                    "json": str(it.json_path), "action": it.action,
+                    "status": it.status, "phase": it.phase,
+                    "detail": it.detail, "words": it.words,
                     "entries": it.entries, "dialogue": it.dialogue,
                     "seconds": round(it.seconds, 1), "llm_note": it.llm_note}
-
-        # pre-settle the files the planner will skip, so the first event the
-        # UI sees already shows them as skipped rather than pending
-        for it in items:
-            if it.action == b.ACT_SKIP:
-                it.status, it.detail = b.ST_SKIPPED, it.reason
-        manager.emit(job, "plan", {"items": [file_ev(it) for it in items]})
 
         def persist(it: b.BatchItem, res) -> None:
             # same hand-off as a single run, so "去精修" reopens what the
@@ -860,25 +957,35 @@ def create_app(cfg: Config) -> FastAPI:
                 stale = _edit_path(res.json_path)
                 if stale.exists():
                     stale.unlink()
+            _prewarm_playback(job, it.audio, prefix(it))
 
         def prefix(it: b.BatchItem) -> str:
-            return "[%d/%d] " % (index[id(it)] + 1, total)
+            if it.index < 0:            # a line about the batch itself
+                return ""
+            return "[%d/%d] " % (it.index + 1, len(report.items))
 
-        await b.run_batch(
+        queue = b.BatchQueue(
             cfg, report,
             keep=not auto_delete_conversation(cfg),
             segment_params=sp, post_params=pp, use_llm=body.use_llm,
+            llm_jobs=llm_jobs(cfg),
             on_item_start=lambda i, t, it: manager.emit(job, "file", file_ev(it)),
             on_item_done=lambda i, t, it: manager.emit(job, "file", file_ev(it)),
+            on_item_phase=lambda it: manager.emit(job, "file", file_ev(it)),
             on_stage=lambda it, s, d: manager.emit(
-                job, "stage", {"stage": s, "detail": d, "file_index": index[id(it)]}),
-            on_log=lambda it, m: manager.emit(
-                job, "log", {"line": (prefix(it) if id(it) in index else "") + m}),
+                job, "stage", {"stage": s, "detail": d, "file_index": it.index}),
+            on_log=lambda it, m: manager.emit(job, "log", {"line": prefix(it) + m}),
             on_result=persist)
-        # items cancelled by an abort never reached on_item_done
-        for it in items:
-            if it.status == b.ST_CANCELLED:
-                manager.emit(job, "file", file_ev(it))
+        # the skipped files are settled by now, so the first event the UI
+        # sees already shows them as skipped rather than pending
+        manager.emit(job, "plan", {"items": [file_ev(it) for it in items]})
+        # the append/remove endpoints act on the queue and report the files
+        # they touched with the same event shape
+        job.control = SimpleNamespace(queue=queue, file_ev=file_ev)
+        try:
+            await queue.run()
+        finally:
+            job.control = None
         if report.aborted:
             raise RuntimeError(report.aborted)
         return report.to_dict()

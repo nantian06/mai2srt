@@ -172,3 +172,107 @@ def test_a_second_job_is_refused_while_a_batch_runs(client, tmp_path, monkeypatc
     r = c.post("/api/jobs", json={"kind": "batch", "audio_paths": [str(tmp_path / "in" / "a.mp3")]})
     assert r.status_code == 409
     settle(c, job_id)
+
+
+# ------------------------------------------------- the queue while it runs
+
+def test_files_dropped_on_a_running_batch_join_it(client, tmp_path, monkeypatch):
+    c, _ = client
+    fake = Fake(monkeypatch)
+    fake.delay = 0.2
+    a = touch(tmp_path / "in" / "a.mp3")
+    d = touch(tmp_path / "in" / "d.mp3")
+    job_id = start(c, [a])
+    time.sleep(0.05)
+    r = c.post("/api/jobs/%s/files" % job_id, json={"audio_paths": [str(d), str(a)]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [i["index"] for i in body["items"]] == [1]       # a is already running
+    assert body["ignored"] == 1
+    listed = next(j for j in c.get("/api/jobs").json()["jobs"] if j["id"] == job_id)
+    assert listed["title"] == "2 files"
+    assert listed["meta"]["audio_paths"] == [str(a), str(d)]
+    assert settle(c, job_id) == "done"
+    result = next(dt for t, dt in events(c, job_id) if t == "done")
+    assert result["done"] == 2
+    assert [p.name for p, _ in fake.full] == ["a.mp3", "d.mp3"]
+    # the appended file announced itself with an index the plan did not have
+    assert any(t == "file" and dt["index"] == 1 and dt["status"] == "pending"
+               for t, dt in events(c, job_id))
+    # a finished batch takes no more files: the client starts a new one
+    r = c.post("/api/jobs/%s/files" % job_id, json={"audio_paths": [str(d)]})
+    assert r.status_code == 409
+
+
+def test_a_waiting_file_can_be_taken_out(client, tmp_path, monkeypatch):
+    c, _ = client
+    fake = Fake(monkeypatch)
+    fake.delay = 0.2
+    files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abc"]
+    job_id = start(c, files)
+    time.sleep(0.05)
+    assert c.delete("/api/jobs/%s/files/0" % job_id).status_code == 409   # running
+    assert c.delete("/api/jobs/%s/files/2" % job_id).status_code == 200
+    assert settle(c, job_id) == "done"
+    evs = events(c, job_id)
+    assert any(t == "file" and d["index"] == 2 and d["status"] == "removed" for t, d in evs)
+    result = next(d for t, d in evs if t == "done")
+    assert [i["index"] for i in result["items"]] == [0, 1]
+    assert [p.name for p, _ in fake.full] == ["a.mp3", "b.mp3"]
+
+
+def test_queue_endpoints_refuse_what_is_not_a_running_batch(client, tmp_path, monkeypatch):
+    c, _ = client
+    Fake(monkeypatch)
+    assert c.post("/api/jobs/nope/files", json={"audio_paths": []}).status_code == 404
+    job_id = start(c, [touch(tmp_path / "in" / "a.mp3")])
+    settle(c, job_id)
+    assert c.delete("/api/jobs/%s/files/0" % job_id).status_code == 409
+
+
+def test_file_events_carry_the_pipeline_phase(client, tmp_path, monkeypatch):
+    c, _ = client
+    Fake(monkeypatch)
+    job_id = start(c, [touch(tmp_path / "in" / "a.mp3")])
+    settle(c, job_id)
+    phases = [d["phase"] for t, d in events(c, job_id) if t == "file"]
+    for p in ("prepare", "wait_upload", "upload", "wait_segment", "segment"):
+        assert p in phases
+    assert phases[-1] == ""                       # settled
+
+
+def test_a_single_file_batch_is_titled_by_its_name(client, tmp_path, monkeypatch):
+    c, _ = client
+    Fake(monkeypatch)
+    job_id = start(c, [touch(tmp_path / "in" / "talk.mp3")])
+    listed = next(j for j in c.get("/api/jobs").json()["jobs"] if j["id"] == job_id)
+    assert listed["title"] == "talk.mp3"
+    settle(c, job_id)
+
+
+def test_retranscribe_redoes_just_the_named_file(client, tmp_path, monkeypatch):
+    c, cfg = client
+    fake = Fake(monkeypatch)
+    one = touch(tmp_path / "in" / "one.mp3")
+    two = touch(tmp_path / "in" / "two.mp3")
+    for f in (one, two):
+        make_project(cfg, f)
+        touch(f.with_suffix(".srt"))
+    job_id = start(c, [one, two], overwrite_paths=[str(two)])
+    assert settle(c, job_id) == "done"
+    assert [p.name for p, _ in fake.full] == ["two.mp3"]
+    result = next(d for t, d in events(c, job_id) if t == "done")
+    assert (result["done"], result["skipped"]) == (1, 1)
+
+
+def test_llm_concurrency_setting_roundtrip_and_use(client, tmp_path, monkeypatch):
+    c, _ = client
+    assert c.get("/api/batch/settings").json() == {"llm_jobs": 1, "max_llm_jobs": 4}
+    assert c.put("/api/batch/settings", json={"llm_jobs": 9}).status_code == 400
+    assert c.put("/api/batch/settings", json={"llm_jobs": 2}).json()["llm_jobs"] == 2
+    assert c.get("/api/batch/settings").json()["llm_jobs"] == 2
+    fake = Fake(monkeypatch)
+    fake.segment_delay = 0.15
+    job_id = start(c, [touch(tmp_path / "in" / f"{n}.mp3") for n in "abc"])
+    assert settle(c, job_id) == "done"
+    assert fake.seg_peak == 2
