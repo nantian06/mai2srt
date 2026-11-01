@@ -8,7 +8,7 @@
 
 把音频或视频拖进窗口，得到词级时间戳的转录，按自己的习惯精修断句，导出标准 SRT。
 
-转录免费 · 不需要 GPU · Windows 10 / 11
+转录免费 · 不需要 GPU · Windows 10 / 11（桌面应用）· Linux（CLI 与批量转录，源码运行）
 
 <br />
 
@@ -129,6 +129,8 @@ mai2srt 把这些补齐：超限文件自动压缩、按静音分块，词级时
 
 FFmpeg 已随安装包内置，**不需要**自行安装。
 
+**Linux** 支持从源码运行（CLI，含批量转录；桌面应用目前只有开发模式），暂无 Linux 安装包，详见 [Linux](#linux)。
+
 ---
 
 ## 安装
@@ -148,6 +150,8 @@ FFmpeg 已随安装包内置，**不需要**自行安装。
 2. 需要大模型帮忙断句的话，去 **设置 → 大模型 → 添加服务商**，选一个服务商、填上 API key，再把它设为当前模型。不配也行，只按标点和停顿来断，字幕照样出
 
     <img src="docs/image/readme/settings-llm.webp" alt="mai2srt 大模型设置页（余烬 / 暗黑主题）" width="94%" />
+
+**一次转录多个文件：** 同时拖入或选择多个音视频文件，页面就变成一个队列——可以先移除不想要的，再点「批量转录（N）」，每一行显示自己的状态（等待 / 进行中 / 完成 / 跳过 / 失败，失败会写明原因）。已有转录结果和字幕的文件会被跳过，所以失败后点「重试失败项」就是把这一批再跑一遍。批量转录共用一个浏览器会话、一个接一个处理；命令行对应的是 [`mai2srt batch`](#批量转录)。
 
 3. 去 **转录**页，把音频或视频文件拖进窗口（或点击选择），决定「LLM 断句」开关要不要开，点「开始转录」，耐心等结果
 4. 转录结束后会得到两个文件：`.mai.json`（词级时间戳，存在项目库 `文档\mai2srt`）和 `.srt`（按断句结果生成，存在源文件旁）
@@ -199,6 +203,43 @@ Windows 设置 → 应用 → 已安装的应用 → mai2srt → 卸载（或在
 
 ---
 
+## Linux
+
+暂无 Linux 安装包，后端与 `mai2srt` 命令从源码运行。
+
+**安装**
+
+```bash
+sudo apt install ffmpeg            # 或：sudo dnf install ffmpeg / sudo pacman -S ffmpeg
+git clone https://github.com/fuxiaomoke/mai2srt.git && cd mai2srt
+pip install -e .[dev]
+playwright install chromium        # 仅当本机没有 Google Chrome / Chromium / Microsoft Edge 时需要
+```
+
+浏览器的探测顺序：Google Chrome → Microsoft Edge → playwright 自带 chromium → 发行版的 `chromium` 包（snap 版 chromium 不会被使用：它读不到主目录下的配置目录）。Linux 上不内置 FFmpeg，需要在 `PATH` 里。
+
+**没有显示器的机器（服务器、容器）怎么登录**
+
+登录需要一个可见的浏览器窗口。在有桌面的机器上登录一次，再把登录态搬过去：
+
+```bash
+# 有桌面的机器上
+mai2srt login
+mai2srt session export session.json     # 这个文件等同于登录凭证，请妥善保管（写出时权限为 600）
+
+# 服务器上
+mai2srt session import session.json     # 导入后请删除 session.json
+mai2srt consent                         # 仅首次需要，见常见问题
+```
+
+登录态过期后重复一次导出 / 导入即可。没有显示器时直接运行 `mai2srt login` 会给出指引，而不是在浏览器里报错。
+
+**数据位置** 与 Windows 一致：会话、设置与日志在 `~/.mai2srt/`，项目库在 `~/Documents/mai2srt/`。
+
+**桌面应用开发模式**：`./dev.sh`（需要 Node ≥ 20、pnpm、Rust 工具链及 Tauri 的 Linux 系统依赖）。这条路径目前没有测试覆盖。
+
+---
+
 ## 从源码运行
 
 需要 Python ≥ 3.10、Node ≥ 20、pnpm、Rust 工具链，以及 PATH 里的 FFmpeg——然后：
@@ -217,7 +258,7 @@ cd app && pnpm install && cd ..
 
 ## 命令行
 
-GUI 覆盖全部常用场景；CLI 适合写进脚本做自动化——一次一个文件，要批量可以写个循环去运行。`mai2srt` 命令由 Python 包提供（见上方「从源码运行」），安装包不会把它加进 PATH。日志同时输出到终端与 `~/.mai2srt/logs/mai2srt.log`，加 `-v` 得到调试级输出。
+GUI 覆盖全部常用场景；CLI 适合写进脚本做自动化，`mai2srt batch` 可以一次处理整个文件夹。`mai2srt` 命令由 Python 包提供（见上方「从源码运行」），安装包不会把它加进 PATH。日志同时输出到终端与 `~/.mai2srt/logs/mai2srt.log`，加 `-v` 得到调试级输出。
 
 ```powershell
 # 登录：弹出浏览器完成微软账号登录，会话持久化（之后长期免登录）
@@ -243,6 +284,33 @@ mai2srt process "abc.mai.json" --no-llm                # 跳过 LLM，只用标�
 mai2srt run "abc.wav"
 mai2srt run "abc.wav" --out D:\out\abc.srt --json D:\out\abc.mai.json
 ```
+
+### 批量转录
+
+```bash
+mai2srt batch ~/recordings                        # 文件夹里所有音视频
+mai2srt batch ~/recordings -r                     # ……含子文件夹
+mai2srt batch a.mp3 b.mp4 ~/more                  # 文件与文件夹混合
+mai2srt batch ~/recordings --out-dir ~/subs       # 所有 .srt 集中放到一个文件夹
+mai2srt batch ~/recordings --dry-run              # 只列出会转录 / 只重新断句 / 会跳过的文件，不做任何改动
+mai2srt batch ~/recordings --report report.json   # 另外写一份机器可读的汇总
+```
+
+- **整批共用一个浏览器会话**，只启动一次，所以一百个文件不意味着启动一百次浏览器。默认一个接一个；`--jobs 2` / `--jobs 3` 并行上传（上限 3——playground 是免费的共享服务，请谨慎调高）。
+- **可以放心重跑。** 转录结果（在项目库里）和 `.srt` 都存在才算完成，完成的文件会被跳过；只有转录结果、缺 `.srt` 的文件只重新断句，不会再次上传。`--overwrite` 全部重做。
+- **失败互相隔离。** 单个坏文件（媒体损坏、某次上传反复失败）会被记录，批量继续；结束时的汇总列出每个文件的结果，有失败则退出码非 0。会让所有文件都失败的问题——未登录、会话过期、生物特征通知（HTTP 451）、没有可用的浏览器——会立即中止整批并告诉你怎么修。
+- **Ctrl-C** 中止当前文件，打印已完成的部分，退出码 130。重新运行同一条命令即可继续。
+- `--out-dir` 把字幕集中到一个文件夹；不同文件夹里的同名文件会在文件名里加一段短哈希（`clip-3fa9c1.srt`），而不是互相覆盖。不加 `--out-dir` 时，每个 `.srt` 和 `run` 一样放在源文件旁边。
+- 断句选项（`--no-llm`、`--max-chars` 等）与 `run` 相同。LLM 调用失败的文件会回退到规则断句，汇总里记在「LLM fallback」一列。
+
+### 在机器之间搬运登录态
+
+```bash
+mai2srt session export session.json    # 把当前账号的登录态写到文件（权限 600）
+mai2srt session import session.json    # 在另一台机器上导入，并设为当前账号
+```
+
+这个文件等同于登录凭证，拿到它的人可以使用该账号。请妥善保管，导入后删除。
 
 另有 `mai2srt serve --port 47613`：GUI 的后端服务进程，应用自己会拉起，一般无需手动运行（开发调试除外）。
 

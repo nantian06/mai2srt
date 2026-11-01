@@ -12,6 +12,9 @@ import path from "node:path";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const BACKEND_PORT = 47613;
+// Windows ships `python`; most Linux/macOS installs only provide `python3`.
+// MAI2SRT_PYTHON overrides both (e.g. a virtualenv's interpreter).
+const PYTHON = process.env.MAI2SRT_PYTHON || (process.platform === "win32" ? "python" : "python3");
 
 function portOpen(port, host) {
   return new Promise((resolve) => {
@@ -51,7 +54,7 @@ async function main() {
   // backend: spawn only when the port is free (hot-restart friendliness)
   if (!(await portOpen(BACKEND_PORT, "127.0.0.1"))) {
     procs.push(
-      spawn("python", ["-m", "mai2srt.cli", "serve", "--port", String(BACKEND_PORT)], {
+      spawn(PYTHON, ["-m", "mai2srt.cli", "serve", "--port", String(BACKEND_PORT)], {
         stdio: "inherit",
         cwd: path.resolve(here, ".."),
         shell: true,

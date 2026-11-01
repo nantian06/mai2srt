@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -68,6 +69,43 @@ def _default_log(msg: str) -> None:
     log.info("%s", msg)
 
 
+class AuthRequired(TranscribeError):
+    """The playground session is gone and silent SSO could not restore it.
+
+    A global condition: every further upload would fail the same way, so a
+    batch aborts on it instead of failing file after file.
+    """
+
+
+NOT_SIGNED_IN_MSG = "登录失效：请先在设置页重新登录 (session expired; sign in first)"
+
+
+@asynccontextmanager
+async def browser_session(cfg: Config, on_log: LogCb = _default_log):
+    """A headless, authenticated playground page, closed on exit.
+
+    transcribe_audio opens one per call; a batch opens ONE and shares it, so
+    the browser start-up and the sign-in probe are paid once, not per file.
+    headless: transcription must never pop a browser window at the user; auth
+    leans on the cookie jar + silent SSO only.
+    """
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        ctx = await browser.launch(p, cfg, headless=True)
+        try:
+            page = await browser.open_page(ctx)
+            status = await browser.ensure_auth(page, cfg, interactive=False)
+            if status != 200:
+                on_log(NOT_SIGNED_IN_MSG)
+                raise AuthRequired("not signed in")
+            yield page
+        finally:
+            try:
+                await ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 async def transcribe_audio(
     cfg: Config,
     audio: Path,
@@ -77,8 +115,13 @@ async def transcribe_audio(
     on_stage: StageCb = _noop_stage,
     on_log: LogCb = _default_log,
     on_consent: ConsentCb | None = None,
+    page=None,
 ) -> tuple[dict, object]:
-    """Probe -> prepare -> upload per chunk -> stitch. Returns (doc, stitched)."""
+    """Probe -> prepare -> upload per chunk -> stitch. Returns (doc, stitched).
+
+    ``page``: an already-authenticated playground page (see browser_session)
+    to upload through; None opens, and afterwards closes, a private one.
+    """
     if not audio.exists():
         raise TranscribeError(f"audio not found: {audio}")
     on_stage("prepare", audio.name)
@@ -107,58 +150,17 @@ async def transcribe_audio(
         on_log("media preparation failed: %s" % e)
         raise
 
-    import time
     parts = []
     raws = []
     try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            # headless: transcription must never pop a browser window at the
-            # user; auth leans on the cookie jar + silent SSO only
-            ctx = await browser.launch(p, cfg, headless=True)
-            page = await browser.open_page(ctx)
-            status = await browser.ensure_auth(page, cfg, interactive=False)
-            if status != 200:
-                on_log("登录失效：请先在设置页重新登录 (session expired; sign in first)")
-                raise TranscribeError("not signed in")
-
-            for i, (upath, offset) in enumerate(pieces):
-                on_stage("upload", "chunk %d/%d" % (i + 1, len(pieces)))
-                try:
-                    res = await transcribe_file(
-                        page, upath, _mime(upath),
-                        diarize=diarize,
-                        keep=keep,
-                        title="mai2srt %s %s" % (audio.stem[:30],
-                                                 time.strftime("%m%d_%H%M")),
-                        reauth=lambda: browser.ensure_auth(page, cfg, interactive=False),
-                        consent=on_consent,
-                    )
-                except BiometricConsentRequired as e:
-                    # the GUI has no prompt here (on_consent is None): the
-                    # error text itself carries the settings-page guidance;
-                    # the log line below makes it visible in the job log too
-                    on_log("需要先接受一次生物特征通知（设置页 → 「接受生物特征通知」，"
-                           "或 CLI: mai2srt consent），然后重试转录")
-                    raise
-                raws.append(res.rich)
-                if res.cleanup_ok is False:
-                    # "leave no trace" failed: the promise is user-facing, so
-                    # the failure must be too (file-log-only is not enough)
-                    on_log("会话清理删除失败：该转录记录仍留在 playground 上，"
-                           "可稍后在网页手动删除 (conversation cleanup failed)")
-                on_stage("transcribe", "chunk %d" % (i + 1))
-                t = parse_rich(res.rich)
-                if not has_word_timestamps(t):
-                    on_log("chunk %d returned no word timestamps; aborting" % i)
-                    raise TranscribeError(f"chunk {i}: no word timestamps")
-                parts.append((t, offset, upath.name))
-                on_log("chunk %d done: %d utts / %d words" % (
-                    i, len(t.utterances), len(t.words)))
-            try:
-                await ctx.close()
-            except Exception:  # noqa: BLE001
-                pass
+        if page is not None:
+            await _upload_pieces(page, cfg, audio, pieces, diarize, keep,
+                                 parts, raws, on_stage, on_log, on_consent)
+        else:
+            async with browser_session(cfg, on_log) as own_page:
+                await _upload_pieces(own_page, cfg, audio, pieces, diarize,
+                                     keep, parts, raws, on_stage, on_log,
+                                     on_consent)
     finally:
         import shutil
         await asyncio.to_thread(shutil.rmtree, workdir, ignore_errors=True)
@@ -166,6 +168,44 @@ async def transcribe_audio(
     stitched = stitch(parts, info.duration_s)
     doc = build_document(audio, stitched, raws, include_raw)
     return doc, stitched
+
+
+async def _upload_pieces(page, cfg, audio, pieces, diarize, keep, parts, raws,
+                         on_stage, on_log, on_consent) -> None:
+    """Upload each prepared piece through ``page``; appends to parts/raws."""
+    for i, (upath, offset) in enumerate(pieces):
+        on_stage("upload", "chunk %d/%d" % (i + 1, len(pieces)))
+        try:
+            res = await transcribe_file(
+                page, upath, _mime(upath),
+                diarize=diarize,
+                keep=keep,
+                title="mai2srt %s %s" % (audio.stem[:30],
+                                         time.strftime("%m%d_%H%M")),
+                reauth=lambda: browser.ensure_auth(page, cfg, interactive=False),
+                consent=on_consent,
+            )
+        except BiometricConsentRequired:
+            # the GUI has no prompt here (on_consent is None): the
+            # error text itself carries the settings-page guidance;
+            # the log line below makes it visible in the job log too
+            on_log("需要先接受一次生物特征通知（设置页 → 「接受生物特征通知」，"
+                   "或 CLI: mai2srt consent），然后重试转录")
+            raise
+        raws.append(res.rich)
+        if res.cleanup_ok is False:
+            # "leave no trace" failed: the promise is user-facing, so
+            # the failure must be too (file-log-only is not enough)
+            on_log("会话清理删除失败：该转录记录仍留在 playground 上，"
+                   "可稍后在网页手动删除 (conversation cleanup failed)")
+        on_stage("transcribe", "chunk %d" % (i + 1))
+        t = parse_rich(res.rich)
+        if not has_word_timestamps(t):
+            on_log("chunk %d returned no word timestamps; aborting" % i)
+            raise TranscribeError(f"chunk {i}: no word timestamps")
+        parts.append((t, offset, upath.name))
+        on_log("chunk %d done: %d utts / %d words" % (
+            i, len(t.utterances), len(t.words)))
 
 
 def build_document(source: Path, stitched, raws: list, include_raw: bool) -> dict:
@@ -302,16 +342,19 @@ async def run_full(
     on_stage: StageCb = _noop_stage,
     on_log: LogCb = _default_log,
     on_consent: ConsentCb | None = None,
+    page=None,
+    srt_path: Path | None = None,
 ) -> RunResult:
     """transcribe + segment + postprocess in one shot; writes both artifacts.
 
     json_path: where the .mai.json goes (None = next to the audio, the CLI
-    default; the GUI passes the storage-library path). The .srt ALWAYS
-    lands next to the audio -- subtitles follow the media, transcripts
-    follow the storage policy."""
+    default; the GUI passes the storage-library path). The .srt lands next
+    to the audio unless ``srt_path`` says otherwise (batch --out-dir) --
+    subtitles follow the media, transcripts follow the storage policy.
+    ``page``: a shared authenticated page (batch); None = private browser."""
     doc, stitched = await transcribe_audio(
         cfg, audio, diarize=diarize, keep=keep, include_raw=include_raw,
-        on_stage=on_stage, on_log=on_log, on_consent=on_consent)
+        on_stage=on_stage, on_log=on_log, on_consent=on_consent, page=page)
     json_path = json_path or audio.with_suffix(".mai.json")
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(
@@ -326,7 +369,8 @@ async def run_full(
         segment_params, post_params, use_llm, on_stage, on_log)
     n_dial = sum(1 for e in entries if e.is_dialogue)
     srt = to_srt(entries)
-    srt_path = audio.parent / (audio.stem + ".srt")
+    srt_path = srt_path or audio.parent / (audio.stem + ".srt")
+    srt_path.parent.mkdir(parents=True, exist_ok=True)
     srt_path.write_text(srt, encoding="utf-8")
     on_log("wrote %s" % srt_path)
     if llm_note:
@@ -337,6 +381,45 @@ async def run_full(
         entries=len(entries), dialogue=n_dial,
         entry_list=entries,
         word_refs=sorted(stitched.transcript.words, key=lambda w: w.start),
+        llm_note=llm_note)
+
+
+async def resegment_existing(
+    cfg: Config,
+    json_path: Path,
+    srt_path: Path,
+    segment_params: SegmentParams | None = None,
+    post_params: PostprocessParams | None = None,
+    use_llm: bool = True,
+    on_stage: StageCb = _noop_stage,
+    on_log: LogCb = _default_log,
+) -> RunResult:
+    """Rebuild the SRT from a transcript that is already on disk.
+
+    The resume path of a batch: the (slow, quota-consuming) upload finished
+    in an earlier run and only segmentation/export did not. No browser, no
+    network apart from the optional LLM split calls.
+    """
+    from .transcribe.persist import load_mai_json
+    t = await asyncio.to_thread(load_mai_json, json_path)
+    if not t.words:
+        raise TranscribeError("no words in %s; re-transcribe the source" % json_path)
+    doc = json.loads(json_path.read_text(encoding="utf-8"))
+    on_log("reusing transcript %s (%d words)" % (json_path.name, len(t.words)))
+    entries, llm_note = await asyncio.to_thread(
+        build_entries, cfg, t, t.duration_s, segment_params, post_params,
+        use_llm, on_stage, on_log)
+    n_dial = sum(1 for e in entries if e.is_dialogue)
+    srt = to_srt(entries)
+    srt_path.parent.mkdir(parents=True, exist_ok=True)
+    srt_path.write_text(srt, encoding="utf-8")
+    on_log("wrote %s" % srt_path)
+    if llm_note:
+        on_log("大模型断句未完全生效：%s" % llm_note)
+    return RunResult(
+        doc=doc, srt=srt, json_path=json_path, srt_path=srt_path,
+        words=len(t.words), entries=len(entries), dialogue=n_dial,
+        entry_list=entries, word_refs=sorted(t.words, key=lambda w: w.start),
         llm_note=llm_note)
 
 

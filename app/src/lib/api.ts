@@ -215,7 +215,30 @@ export interface JobEvent {
   ts: number;
 }
 
+/** One file of a batch job, as the plan/file events report it. */
+export interface BatchFile {
+  index: number;
+  total: number;
+  audio: string;
+  srt: string;
+  json: string;
+  /** what the planner chose: upload+segment, re-segment only, or skip */
+  action: 'transcribe' | 'resegment' | 'skip';
+  status: 'pending' | 'running' | 'done' | 'skipped' | 'failed' | 'cancelled';
+  detail: string;
+  entries: number;
+  dialogue: number;
+  seconds: number;
+  llm_note: string | null;
+}
+
 export interface DoneData {
+  // batch job summary (absent for single-file jobs)
+  items?: BatchFile[];
+  done?: number;
+  skipped?: number;
+  failed?: number;
+  llm_fallback?: number;
   srt_path?: string;
   json_path?: string;
   words?: number;
@@ -261,8 +284,12 @@ export async function preflight(
 }
 
 export async function createJob(body: {
-  kind: "run" | "process" | "login" | "consent";
+  kind: "run" | "process" | "batch" | "login" | "consent";
   audio_path?: string;
+  /** batch: media files in run order */
+  audio_paths?: string[];
+  /** batch: redo files that are already finished */
+  overwrite?: boolean;
   mai_json_path?: string;
   use_llm?: boolean;
   params?: Record<string, number | boolean>;
@@ -297,6 +324,10 @@ export async function revealPath(path: string): Promise<void> {
 export function subscribeJob(
   jobId: string,
   handlers: {
+    /** batch jobs: every file with the action the planner chose (once) */
+    onPlan?: (items: BatchFile[]) => void;
+    /** batch jobs: a file started / settled */
+    onFile?: (file: BatchFile) => void;
     onStage?: (stage: string, detail: string) => void;
     onLog?: (line: string) => void;
     onDone?: (data: DoneData) => void;
@@ -308,6 +339,12 @@ export function subscribeJob(
   es.addEventListener("stage", (e) => {
     const d = JSON.parse((e as MessageEvent).data);
     handlers.onStage?.(d.stage, d.detail ?? "");
+  });
+  es.addEventListener("plan", (e) => {
+    handlers.onPlan?.(JSON.parse((e as MessageEvent).data).items);
+  });
+  es.addEventListener("file", (e) => {
+    handlers.onFile?.(JSON.parse((e as MessageEvent).data));
   });
   es.addEventListener("log", (e) => {
     handlers.onLog?.(JSON.parse((e as MessageEvent).data).line);

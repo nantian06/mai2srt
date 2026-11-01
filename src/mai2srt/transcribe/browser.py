@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
+import sys
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -27,17 +29,67 @@ log = logging.getLogger("mai2srt.browser")
 AUTH_PROBE_JS = ("async () => { const r = await fetch('/.auth/me'); "
                  "return r.status; }")
 
-#: playwright channel -> (exe name for PATH lookup, well-known install paths)
-CHANNEL_HINTS = {
-    "chrome": ("chrome.exe", [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]),
-    "msedge": ("msedge.exe", [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]),
-}
+#: playwright channel -> (exe names for PATH lookup, well-known install paths)
+#: "chromium-system" is not a playwright channel: it is the distro's own
+#: chromium package (Linux), used only as a last resort when playwright's
+#: bundled chromium has not been downloaded.
+if sys.platform == "win32":
+    CHANNEL_HINTS = {
+        "chrome": (["chrome.exe"], [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]),
+        "msedge": (["msedge.exe"], [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]),
+    }
+elif sys.platform == "darwin":
+    CHANNEL_HINTS = {
+        "chrome": (["google-chrome"], [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]),
+        "msedge": (["microsoft-edge"], [
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]),
+    }
+else:
+    CHANNEL_HINTS = {
+        "chrome": (["google-chrome", "google-chrome-stable", "chrome"], [
+            "/opt/google/chrome/chrome",
+            "/usr/bin/google-chrome",
+        ]),
+        "msedge": (["microsoft-edge", "microsoft-edge-stable", "msedge"], [
+            "/opt/microsoft/msedge/msedge",
+            "/usr/bin/microsoft-edge",
+        ]),
+        # /snap/bin/chromium is deliberately absent: a snap-confined browser
+        # cannot read the dot-directory profile under the home folder
+        "chromium-system": (["chromium", "chromium-browser"], [
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]),
+    }
+
+#: channels playwright itself understands via ``channel=``; everything else
+#: found on disk is launched through ``executable_path``
+_PLAYWRIGHT_CHANNELS = ("chrome", "msedge")
+
+
+def _is_snap(path: str) -> bool:
+    """A snap-confined browser, directly or behind a launcher shim.
+
+    Ubuntu's /usr/bin/chromium(-browser) is a tiny script that execs the snap;
+    the snap sandbox cannot read the dot-directory profile under $HOME, so
+    driving it fails in confusing ways.
+    """
+    try:
+        if "/snap/" in os.path.realpath(path).replace("\\", "/"):
+            return True
+        p = Path(path)
+        return p.stat().st_size < 8192 and b"/snap/" in p.read_bytes()
+    except OSError:
+        return False
 
 
 def find_channel_exe(channel: str) -> str | None:
@@ -45,12 +97,13 @@ def find_channel_exe(channel: str) -> str | None:
     hint = CHANNEL_HINTS.get(channel)
     if not hint:
         return None
-    exe, paths = hint
-    hit = shutil.which(exe)
-    if hit:
-        return hit
+    names, paths = hint
+    for exe in names:
+        hit = shutil.which(exe)
+        if hit and not _is_snap(hit):
+            return hit
     for p in paths:
-        if Path(p).exists():
+        if Path(p).exists() and not _is_snap(p):
             return p
     return None
 
@@ -71,7 +124,36 @@ def resolve_channel(cfg: Config) -> str | None:
     for ch in order:
         if find_channel_exe(ch):
             return ch
+    # Linux: no Chrome/Edge, and playwright's own chromium was never
+    # downloaded -> the distro's chromium package beats failing at launch
+    if ("chromium-system" in CHANNEL_HINTS and find_channel_exe("chromium-system")
+            and not _bundled_chromium_present()):
+        return "chromium-system"
     return None
+
+
+def _bundled_chromium_present() -> bool:
+    from ..preflight import bundled_chromium_present
+    return bundled_chromium_present()
+
+
+def display_available() -> bool:
+    """Can a visible browser window open here? Always True off Linux; on
+    Linux a window needs an X11 or Wayland display."""
+    if not sys.platform.startswith("linux"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+NO_DISPLAY_MESSAGE = (
+    "没有可用的图形显示（DISPLAY / WAYLAND_DISPLAY 均未设置），无法打开浏览器登录。"
+    "请在有桌面的机器上执行 `mai2srt login`，然后用 `mai2srt session export <file>` "
+    "导出登录态，在本机用 `mai2srt session import <file>` 导入 "
+    "(no display: sign in on a desktop machine, then export/import the session)")
+
+
+class NoDisplayError(RuntimeError):
+    """A visible browser was requested on a Linux box with no display."""
 
 
 async def launch(p: Playwright, cfg: Config, headless: bool = False) -> BrowserContext:
@@ -92,6 +174,8 @@ async def launch(p: Playwright, cfg: Config, headless: bool = False) -> BrowserC
       needs manual directory surgery. The cookie jar (browser-agnostic)
       still restores the session afterwards.
     """
+    if not headless and not display_available():
+        raise NoDisplayError(NO_DISPLAY_MESSAGE)
     channel = resolve_channel(cfg)
     base = cfg.profile_dir                      # per-account base dir
     candidates = ([channel] if channel else []) + [None]  # None = bundled
@@ -113,9 +197,15 @@ async def launch(p: Playwright, cfg: Config, headless: bool = False) -> BrowserC
         )
         for attempt in (1, 2):
             try:
-                if cand:
+                if cand in _PLAYWRIGHT_CHANNELS and sys.platform == "win32":
                     ctx = await p.chromium.launch_persistent_context(
                         channel=cand, **kwargs)
+                elif cand:
+                    # Linux/macOS: the exact binary find_channel_exe located
+                    # (playwright's channel lookup only knows the vendor's
+                    # default install prefix)
+                    ctx = await p.chromium.launch_persistent_context(
+                        executable_path=find_channel_exe(cand), **kwargs)
                 else:
                     ctx = await p.chromium.launch_persistent_context(**kwargs)
                 log.info("browser channel: %s%s", name,

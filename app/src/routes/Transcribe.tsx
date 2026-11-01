@@ -5,12 +5,13 @@ import {
   SlidersHorizontal, Upload, Wand2,
 } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
+import { BatchQueue } from '../components/BatchQueue';
 import { Button, Card, StatusDot, Toggle, useToast } from '../components/ui';
 import { useI18n, type Key } from '../lib/i18n';
 import {
   cancelJob, createJob, getSubtitleParams, getSystem, preflight, revealPath,
   subscribeJob, warmParams, warmSystem, withBackendRetry,
-  type DoneData, type PreflightKey, type SubtitleParams, type SystemInfo,
+  type BatchFile, type DoneData, type PreflightKey, type SubtitleParams, type SystemInfo,
 } from '../lib/api';
 import { loadUseLlm, storeUseLlm } from '../lib/subtitle';
 
@@ -56,6 +57,10 @@ export function TranscribePage() {
   const [sys, setSys] = useState<SystemInfo | null>(warmSystem);
   const [path, setPath] = useState('');
   const [isJson, setIsJson] = useState(false);
+  // two or more media files = a batch (a single file keeps the classic flow)
+  const [batchPaths, setBatchPaths] = useState<string[]>([]);
+  // the batch job's per-file state (plan event, then one event per change)
+  const [files, setFiles] = useState<BatchFile[]>([]);
   // shared with the refine workspace (persisted) so both pages agree
   const [useLlm, setUseLlmState] = useState(loadUseLlm);
   const [params, setParams] = useState<SubtitleParams | null>(warmParams);
@@ -74,6 +79,7 @@ export function TranscribePage() {
 
   const running = jobId !== null && !result && !error;
   const busy = starting || running;
+  const isBatch = batchPaths.length > 1;
 
   const setUseLlm = (v: boolean) => {
     setUseLlmState(v);
@@ -100,6 +106,46 @@ export function TranscribePage() {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [logs]);
 
+  /** One entry point for drop + browse: decides single vs batch. */
+  function selectPaths(paths: string[]) {
+    const ok = paths.filter((p) => classify(p) !== null);
+    if (ok.length === 0) {
+      toast('warn', t('t.drop.rejected'));
+      return;
+    }
+    if (paths.length > ok.length) {
+      toast('warn', tf('t.batch.rejected', { n: paths.length - ok.length }));
+    }
+    const media = ok.filter((p) => classify(p) !== 'json');
+    if (ok.length > 1 && media.length > 0 && media.length < ok.length) {
+      toast('warn', t('t.batch.jsonIgnored'));
+    }
+    if (media.length > 1) {
+      setIsJson(false);
+      setPath('');
+      setBatchPaths(media);
+    } else {
+      const p = media[0] ?? ok[0];
+      setIsJson(p.endsWith('.mai.json'));
+      setPath(p);
+      setBatchPaths([]);
+    }
+    setFiles([]);
+    setResult(null);
+    setError('');
+  }
+
+  function removeFromQueue(p: string) {
+    const left = batchPaths.filter((x) => x !== p);
+    if (left.length > 1) {
+      setBatchPaths(left);
+    } else {
+      // down to one file (or none): back to the single-file flow
+      setBatchPaths([]);
+      setPath(left[0] ?? '');
+    }
+  }
+
   // native drag-drop with absolute paths (tauri)
   useEffect(() => {
     let un: (() => void) | undefined;
@@ -109,16 +155,9 @@ export function TranscribePage() {
         un = await getCurrentWebview().listen<{ paths: string[] }>(
           'tauri://drag-drop',
           (e) => {
-            const p = e.payload.paths?.[0];
-            if (!p) return;
-            if (classify(p) === null) {
-              toast('warn', t('t.drop.rejected'));
-              return;
-            }
-            setIsJson(p.endsWith('.mai.json'));
-            setPath(p);
-            setResult(null);
-            setError('');
+            const dropped = e.payload.paths ?? [];
+            if (dropped.length === 0) return;
+            selectPaths(dropped);
           },
         );
       } catch { /* plain browser */ }
@@ -127,20 +166,18 @@ export function TranscribePage() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function pick() {
-    const p = await open({
-      multiple: false,
+    // the dialog's overloads key off a literal `multiple`; ours is a runtime flag
+    const p = (await open({
+      multiple: !isJson,
       filters: isJson
         ? [{ name: 'mai2srt json', extensions: ['json'] }]
         : [
             { name: 'audio', extensions: AUDIO_EXTS },
             { name: 'video', extensions: VIDEO_EXTS },
           ],
-    });
-    if (typeof p === 'string') {
-      setPath(p);
-      setResult(null);
-      setError('');
-    }
+    })) as string | string[] | null;
+    if (typeof p === 'string') selectPaths([p]);
+    else if (Array.isArray(p) && p.length > 0) selectPaths(p);
   }
 
   async function start() {
@@ -165,18 +202,32 @@ export function TranscribePage() {
       setResult(null);
       setLogs([]);
       setStage('');
+      setFiles([]);
       const job = await createJob(
-        isJson
-          ? { kind: 'process', mai_json_path: path, use_llm: useLlm }
-          : { kind: 'run', audio_path: path, use_llm: useLlm },
+        isBatch
+          ? { kind: 'batch', audio_paths: batchPaths, use_llm: useLlm }
+          : isJson
+            ? { kind: 'process', mai_json_path: path, use_llm: useLlm }
+            : { kind: 'run', audio_path: path, use_llm: useLlm },
       );
       setJobId(job.id);
       disposeRef.current = subscribeJob(job.id, {
+        onPlan: (items) => setFiles(items),
+        onFile: (f) => setFiles((fs) => fs.map((x) => (x.index === f.index ? f : x))),
         onStage: (s) => setStage(s),
         onLog: (line) => setLogs((ls) => [...ls.slice(-500), line]),
         onDone: (d) => {
           setResult(d);
-          toast('ok', t('t.toast.done'));
+          if (d.items) {
+            // a batch: the summary replaces the single-file toast, and a
+            // failed file makes it a warning (the job itself succeeded)
+            setFiles(d.items);
+            toast((d.failed ?? 0) > 0 ? 'warn' : 'ok', tf('t.batch.summary', {
+              done: d.done ?? 0, skipped: d.skipped ?? 0, failed: d.failed ?? 0,
+            }));
+          } else {
+            toast('ok', t('t.toast.done'));
+          }
           // a partial LLM failure is a quality loss, not a crash: the run
           // succeeded, so warn instead of pretending everything used the model
           if (d.llm_note) {
@@ -199,7 +250,7 @@ export function TranscribePage() {
 
   const stageIdx = STAGES.findIndex((s) => s.id === stage);
   // center the invitation until real work content appears, then anchor top
-  const engaged = busy || logs.length > 0 || !!result || !!error;
+  const engaged = busy || logs.length > 0 || !!result || !!error || isBatch || files.length > 0;
 
   return (
     <div
@@ -263,7 +314,11 @@ export function TranscribePage() {
                 : isVideoPath(path) ? <FileVideo size={26} strokeWidth={1.8} />
                 : <FileAudio size={26} strokeWidth={1.8} />}
             </motion.div>
-            {path ? (
+            {isBatch ? (
+              <p className="text-[15px] font-semibold text-ink-1">
+                {tf('t.batch.files', { n: batchPaths.length })}
+              </p>
+            ) : path ? (
               <>
                 <p className="text-[15px] font-semibold text-ink-1">
                   {path.split(/[\\/]/).pop()}
@@ -278,6 +333,15 @@ export function TranscribePage() {
           </div>
         </Card>
       </div>
+
+      {/* batch queue: removable rows before the start, live statuses after */}
+      {(isBatch || files.length > 0) && (
+        <BatchQueue
+          files={files}
+          selected={batchPaths}
+          onRemove={busy || files.length > 0 ? undefined : removeFromQueue}
+        />
+      )}
 
       {/* persisted subtitle params (all 8, edited on the refine page): sits
           ABOVE the action row so it reads as "what will this run use"
@@ -321,9 +385,17 @@ export function TranscribePage() {
       {/* controls: actions left, options right so the row uses its width */}
       <div className="flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
-          <Button onClick={start} busy={busy} disabled={!path || busy}>
-            {busy ? t('t.action.running') : isJson ? t('t.action.process') : t('t.action.run')}
+          <Button onClick={start} busy={busy} disabled={!(path || isBatch) || busy}>
+            {busy ? t('t.action.running')
+              : isJson ? t('t.action.process')
+              : isBatch ? tf('t.batch.start', { n: batchPaths.length })
+              : t('t.action.run')}
           </Button>
+          {!busy && (result?.failed ?? 0) > 0 && (
+            <Button variant="ghost" onClick={start}>
+              {t('t.batch.retry')}
+            </Button>
+          )}
           {running && (
             <Button variant="danger" onClick={() => jobId && cancelJob(jobId).catch(() => {})}>
               {t('t.action.cancel')}
@@ -348,6 +420,14 @@ export function TranscribePage() {
             className="overflow-hidden"
           >
             <Card className="flex items-center justify-between px-6 py-4">
+              {isBatch && files.length > 0 && (
+                <span className="mr-4 shrink-0 text-[12px] font-medium text-ink-2">
+                  {tf('t.batch.progress', {
+                    i: Math.max(1, files.findIndex((f) => f.status === 'running') + 1),
+                    n: files.length,
+                  })}
+                </span>
+              )}
               {STAGES.map((s, i) => {
                 const on = i <= stageIdx;
                 const current = i === stageIdx;
@@ -390,7 +470,21 @@ export function TranscribePage() {
       )}
 
       {/* result */}
-      {result && (
+      {result?.items && (
+        <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
+          <Card className="flex items-center justify-between p-5">
+            <span className="text-[14px] font-semibold text-ok">{t('t.result.done')}</span>
+            <span className="text-[12px] text-ink-2">
+              {tf('t.batch.summary', {
+                done: result.done ?? 0, skipped: result.skipped ?? 0, failed: result.failed ?? 0,
+              })}
+              {(result.llm_fallback ?? 0) > 0 &&
+                ` · ${tf('t.batch.fallback', { n: result.llm_fallback ?? 0 })}`}
+            </span>
+          </Card>
+        </motion.div>
+      )}
+      {result && !result.items && (
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
           <Card className="flex flex-col gap-3 p-5">
             <div className="flex items-center justify-between">
@@ -434,7 +528,7 @@ export function TranscribePage() {
           restores its LLM segmentation when the run produced one.
           Styled as a primary action (same colors/hover/shadow as 开始转录)
           but keeps its own size; flush left, not centered */}
-      {result && (
+      {result && (!result.items || (result.done ?? 0) > 0) && (
         <div>
           <button
             onClick={() => window.dispatchEvent(new CustomEvent('mai2srt:nav', { detail: 'refine' }))}

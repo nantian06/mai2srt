@@ -57,8 +57,12 @@ class ActiveIn(BaseModel):
 
 
 class RunIn(BaseModel):
-    kind: str                       # run | process | login | consent
+    kind: str                       # run | process | batch | login | consent
     audio_path: str | None = None
+    #: batch: the media files to transcribe, in order
+    audio_paths: list[str] | None = None
+    #: batch: redo files that already have a transcript + subtitles
+    overwrite: bool = False
     mai_json_path: str | None = None
     use_llm: bool = True
     params: dict = {}
@@ -256,11 +260,16 @@ def create_app(cfg: Config) -> FastAPI:
         Static and instant: the page asks on click and refuses to launch a job
         that cannot work, naming the gap instead of failing a minute later.
         """
-        from ..preflight import KIND_PROCESS, KIND_RUN, missing_requirements
+        from ..preflight import (
+            KIND_PROCESS, KIND_RUN, install_hints, missing_requirements,
+            platform_name,
+        )
         if kind not in (KIND_RUN, KIND_PROCESS):
             raise HTTPException(400, "unknown kind: %s" % kind)
         missing = missing_requirements(cfg, kind=kind, use_llm=use_llm)
-        return {"ok": not missing, "missing": missing}
+        return {"ok": not missing, "missing": missing,
+                "platform": platform_name(),
+                "hints": install_hints(missing)}
 
     # -------------------------------------------------------------- session
 
@@ -418,6 +427,14 @@ def create_app(cfg: Config) -> FastAPI:
                 if not audio.exists():
                     raise HTTPException(400, "audio not found: %s" % audio)
                 job = await manager.start("run", audio.name, lambda j: _run_job(cfg, j, body))
+            elif body.kind == "batch":
+                from ..batch import collect_inputs
+                files, problems = collect_inputs(body.audio_paths or [])
+                if problems or not files:
+                    raise HTTPException(400, "; ".join(problems) or "no input files")
+                job = await manager.start(
+                    "batch", "%d files" % len(files),
+                    lambda j: _batch_job(cfg, j, body, files))
             elif body.kind == "process":
                 src = Path(body.mai_json_path or "")
                 if not src.exists():
@@ -792,6 +809,70 @@ def create_app(cfg: Config) -> FastAPI:
         return {"srt_path": str(res.srt_path), "json_path": str(res.json_path),
                 "words": res.words, "entries": res.entries, "dialogue": res.dialogue,
                 "llm_note": res.llm_note}
+
+    async def _batch_job(cfg: Config, job: Job, body: RunIn, files: list[Path]) -> dict:
+        """Many files, one browser session (see mai2srt.batch).
+
+        Events on top of the usual stage/log: ``plan`` once (every file with
+        the action the planner chose) and ``file`` whenever one settles. A
+        file's failure is a ``file`` event, not a job error; only a global
+        problem (sign-in, 451, no browser) ends the job in error.
+        """
+        from .. import batch as b
+        sp, pp = _effective_params(body.params)
+        items = b.plan_batch(cfg, files, overwrite=body.overwrite)
+        report = b.BatchReport(items)
+        total = len(items)
+        index = {id(it): n for n, it in enumerate(items)}
+
+        def file_ev(it: b.BatchItem) -> dict:
+            return {"index": index[id(it)], "total": total, "audio": str(it.audio),
+                    "srt": str(it.srt), "json": str(it.json_path),
+                    "action": it.action, "status": it.status, "detail": it.detail,
+                    "entries": it.entries, "dialogue": it.dialogue,
+                    "seconds": round(it.seconds, 1), "llm_note": it.llm_note}
+
+        # pre-settle the files the planner will skip, so the first event the
+        # UI sees already shows them as skipped rather than pending
+        for it in items:
+            if it.action == b.ACT_SKIP:
+                it.status, it.detail = b.ST_SKIPPED, it.reason
+        manager.emit(job, "plan", {"items": [file_ev(it) for it in items]})
+
+        def persist(it: b.BatchItem, res) -> None:
+            # same hand-off as a single run, so "去精修" reopens what the
+            # batch produced (LLM segmentation preserved as an edit record)
+            set_last_mai_json(cfg, res.json_path)
+            if body.use_llm and res.entry_list and res.word_refs:
+                _save_edit(res.json_path,
+                           entry_records(res.word_refs, res.entry_list),
+                           subtitle_params(cfg), origin="llm")
+            else:
+                stale = _edit_path(res.json_path)
+                if stale.exists():
+                    stale.unlink()
+
+        def prefix(it: b.BatchItem) -> str:
+            return "[%d/%d] " % (index[id(it)] + 1, total)
+
+        await b.run_batch(
+            cfg, report,
+            keep=not auto_delete_conversation(cfg),
+            segment_params=sp, post_params=pp, use_llm=body.use_llm,
+            on_item_start=lambda i, t, it: manager.emit(job, "file", file_ev(it)),
+            on_item_done=lambda i, t, it: manager.emit(job, "file", file_ev(it)),
+            on_stage=lambda it, s, d: manager.emit(
+                job, "stage", {"stage": s, "detail": d, "file_index": index[id(it)]}),
+            on_log=lambda it, m: manager.emit(
+                job, "log", {"line": (prefix(it) if id(it) in index else "") + m}),
+            on_result=persist)
+        # items cancelled by an abort never reached on_item_done
+        for it in items:
+            if it.status == b.ST_CANCELLED:
+                manager.emit(job, "file", file_ev(it))
+        if report.aborted:
+            raise RuntimeError(report.aborted)
+        return report.to_dict()
 
     async def _process_job(cfg: Config, job: Job, body: RunIn) -> dict:
         # load + segment + LLM calls are all blocking: run the whole body off

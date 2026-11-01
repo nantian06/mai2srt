@@ -18,6 +18,7 @@ wording and its translations.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from .config import Config, active_account, cookie_jar_for, load_app_config
@@ -44,6 +45,40 @@ def missing_requirements(cfg: Config, kind: str = KIND_RUN,
     if use_llm and not llm_configured(cfg):
         missing.append("llm")
     return missing
+
+
+def platform_name() -> str:
+    """Stable platform identifier for the UI: windows | macos | linux."""
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return "linux"
+
+
+def install_hints(missing: list[str]) -> dict[str, str]:
+    """Copy-pasteable fixes for the missing keys on THIS platform.
+
+    Windows ships ffmpeg inside the installer and always has Edge, so it gets
+    none; a Linux/macOS source install must provide both itself.
+    """
+    plat = platform_name()
+    hints: dict[str, str] = {}
+    for key in missing:
+        if key == "ffmpeg":
+            if plat == "linux":
+                hints[key] = ("sudo apt install ffmpeg   "
+                              "(or: sudo dnf install ffmpeg / sudo pacman -S ffmpeg)")
+            elif plat == "macos":
+                hints[key] = "brew install ffmpeg"
+        elif key == "browser" and plat != "windows":
+            hints[key] = ("playwright install chromium   "
+                          "(or install Google Chrome / Chromium / Microsoft Edge)")
+        elif key == "session" and plat == "linux":
+            hints[key] = ("mai2srt login   "
+                          "(no display: mai2srt session import <file> "
+                          "exported on a desktop machine)")
+    return hints
 
 
 def ffmpeg_available() -> bool:
@@ -81,6 +116,8 @@ def bundled_chromium_present() -> bool:
     env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
     if env:
         base = Path(env)
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches" / "ms-playwright"
     else:
         local = os.environ.get("LOCALAPPDATA")
         base = (Path(local) if local else Path.home() / ".cache") / "ms-playwright"
