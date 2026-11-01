@@ -11,6 +11,7 @@ import {
   withBackendRetry,
   type SessionInfo, type SystemInfo,
 } from '../../lib/api';
+import { trackJob } from '../../lib/jobs';
 import { useI18n } from '../../lib/i18n';
 import { StorageCard } from './StorageCard';
 
@@ -56,6 +57,7 @@ export function FilesSettings() {
     setLoginBusy(true);
     try {
       const job = await createJob({ kind: 'login' });
+      trackJob(job);   // listed in the task monitor
       subscribeJob(job.id, {
         onLog: () => {},
         onDone: (d) => {
@@ -94,6 +96,7 @@ export function FilesSettings() {
     setConsentBusy(true);
     try {
       const job = await createJob({ kind: 'consent' });
+      trackJob(job);   // listed in the task monitor
       subscribeJob(job.id, {
         onLog: () => {},
         onDone: (d) => {

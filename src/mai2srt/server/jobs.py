@@ -34,6 +34,11 @@ class Job:
     task: asyncio.Task | None = None
     #: set once the worker has fully wound down (see JobManager.stream)
     finished: bool = False
+    #: when the job settled (status left running), for the monitor's timings
+    finished_at: float | None = None
+    #: what the job was started with (paths, use_llm): lets a client that
+    #: lost its own copy (page switch, webview reload) show and re-attach it
+    meta: dict = field(default_factory=dict)
 
     @property
     def settled(self) -> bool:
@@ -49,6 +54,13 @@ class Job:
             return False
         return self.finished or bool(
             self.events and self.events[-1]["type"] in ("done", "error", "cancelled"))
+
+    def summary(self) -> dict:
+        """The listing/creation view of a job (no event history)."""
+        return {"id": self.id, "kind": self.kind, "title": self.title,
+                "status": self.status, "created_at": self.created_at,
+                "finished_at": self.finished_at, "meta": self.meta,
+                "events": len(self.events)}
 
 
 class JobManager:
@@ -81,6 +93,7 @@ class JobManager:
         kind: str,
         title: str,
         coro_factory: Callable[[Job], Any],
+        meta: dict | None = None,
     ) -> Job:
         """Create and run a job. ``coro_factory(job)`` returns an awaitable.
 
@@ -92,7 +105,8 @@ class JobManager:
         if self._loop is None:
             self._loop = asyncio.get_running_loop()
             self._loop_thread = threading.current_thread()
-        job = Job(id="%s-%d" % (kind, next(self._ids)), kind=kind, title=title)
+        job = Job(id="%s-%d" % (kind, next(self._ids)), kind=kind, title=title,
+                  meta=dict(meta or {}))
         self._jobs[job.id] = job
         job.status = "running"
         job.task = asyncio.create_task(self._run(job, coro_factory))
@@ -120,6 +134,8 @@ class JobManager:
             log.error("job %s (%s) failed: %s", job.id, job.kind, e)
             self.emit(job, "error", {"message": str(e), "type": type(e).__name__})
         finally:
+            if job.finished_at is None:
+                job.finished_at = time.time()
             job.finished = True
             self._wake(job)
 
@@ -172,6 +188,7 @@ class JobManager:
         # suspension point never enters _run, so the except branch below
         # would never fire (task just settles as cancelled).
         job.status = "cancelled"
+        job.finished_at = time.time()
         if job.task:
             # cancel() is reached from a sync FastAPI endpoint (threadpool);
             # Task.cancel() must run on the owning loop
@@ -181,6 +198,18 @@ class JobManager:
             else:
                 job.task.cancel()
         self.emit(job, "cancelled", {})
+        return True
+
+
+    def forget(self, job_id: str) -> bool:
+        """Drop a settled job from the history (the monitor's "remove").
+
+        A job still running cannot be forgotten: its worker keeps emitting.
+        """
+        job = self._jobs.get(job_id)
+        if not job or not job.settled:
+            return False
+        del self._jobs[job_id]
         return True
 
 
