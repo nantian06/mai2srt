@@ -98,6 +98,35 @@ def test_align_lines_uncovered_tail_raises():
     assert raised
 
 
+def test_align_lines_accepts_retyped_punctuation_width_and_case():
+    # model "normalised" 。→. and …→... and fullwidth latin; letters intact
+    words = [Word(c, i * 0.2, i * 0.2 + 0.15, "1")
+             for i, c in enumerate("あいう。かきく…ＡＢ")]
+    pieces = _align_lines(["あいう.", "かきく...ab"], words)
+    assert [join_words(pc) for pc in pieces] == ["あいう。", "かきく…ＡＢ"]
+    # every original word is claimed exactly once, in order (timestamps lossless)
+    assert [w for pc in pieces for w in pc] == words
+
+
+def test_align_lines_loose_keeps_trailing_marks_and_opening_quote_apart():
+    words = [Word(c, i * 0.2, i * 0.2 + 0.15, "1")
+             for i, c in enumerate("あいう。」「かきく。")]
+    pieces = _align_lines(["あいう", "かきく"], words)   # model dropped marks
+    assert [join_words(pc) for pc in pieces] == ["あいう。」", "「かきく。"]
+
+
+def test_align_lines_loose_still_rejects_changed_letters():
+    t = _task(1, "あいう。かきく。")
+    for bad in (["あいう。", "かきこ。"], ["あいう。", "かき。"],
+                ["あいう。", "かきくけ。"]):
+        try:
+            _align_lines(bad, t.words)
+            raised = False
+        except LLMSplitError as e:
+            raised = "mismatch" in str(e)
+        assert raised, bad
+
+
 # ----------------------------------------------------------------- retry
 
 def test_is_retryable_error_policy():
@@ -467,3 +496,43 @@ def test_total_split_success_reports_nothing():
     segment_transcript(t, SegmentParams(), splitter=AllSplitter(),
                        llm_status=status)
     assert status == []
+
+
+def test_unaligned_runs_alone_are_resent_and_kept(monkeypatch):
+    """A run whose lines do not align is re-asked ON ITS OWN, while the runs
+    that already aligned in the same batch are neither lost nor re-sent."""
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    sp = ProtocolSplitter(LLMEndpoint(api_key="k", model="m"))
+    sent: list[list[int]] = []
+
+    def fake_request(endpoint, system, user, **_kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        ids = [rid for rid, _ in _blocks(user)]
+        sent.append(ids)
+        if len(sent) == 1:                      # id=2 rewritten a letter
+            return ('{"results": [{"id": 1, "lines": ["あいう。", "かきく。さしす。"]},'
+                    ' {"id": 2, "lines": ["あいう。", "かきこ。さしす。"]}]}')
+        return '{"results": [{"id": 2, "lines": ["あいう。", "かきく。さしす。"]}]}'
+
+    monkeypatch.setattr(llm, "_request", fake_request)
+    out = sp.choose([_task(1), _task(2)], SegmentParams())
+    assert sorted(out) == [1, 2]
+    assert sent == [[1, 2], [2]]                # only the failed run is re-sent
+
+
+def test_unaligned_run_still_degrades_after_retries(monkeypatch):
+    monkeypatch.setattr(llm, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    sp = ProtocolSplitter(LLMEndpoint(api_key="k", model="m"))
+
+    def fake_request(endpoint, system, user, **_kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        ok = [rid for rid, _ in _blocks(user) if rid == 1]
+        return ('{"results": [%s, {"id": 2, "lines": ["かきこ。"]}]}'
+                % ", ".join('{"id": 1, "lines": ["あいう。かきく。さしす。"]}'
+                            for _ in ok))
+
+    monkeypatch.setattr(llm, "_request", fake_request)
+    out = sp.choose([_task(1), _task(2)], SegmentParams())
+    assert list(out) == [1]                     # 2 never aligned -> upstream fallback

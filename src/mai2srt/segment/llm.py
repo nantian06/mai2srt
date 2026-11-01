@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
@@ -445,28 +446,44 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", "", s or "")
 
 
-def _align_lines(lines: list[str], words: list[Word]) -> list[list[Word]]:
-    """Map the model's subtitle lines back onto contiguous word spans.
+def _loose(s: str) -> str:
+    """Content-only comparison form: NFKC (full/half width, ``…`` vs ``...``),
+    case-folded, with whitespace, punctuation and symbols dropped.
 
-    The prompt's hard constraint ("all lines concatenated == the source")
-    makes each line an exact substring of the token-glued text, so alignment
-    is deterministic: extend a candidate span word by word until its glued
-    text equals the line. Any drift raises LLMSplitError (message carries
-    the 'mismatch' retry marker) -- the batch is retried with a corrective
-    note, then degraded. Timestamps can never be invented or lost here.
+    Models routinely "normalise" punctuation while keeping every letter. That
+    is not a content change, and since the pieces are still cut from the
+    ORIGINAL words, accepting it cannot touch a timestamp or a character.
+    A dropped, added or rewritten letter still differs here.
     """
+    s = unicodedata.normalize("NFKC", s or "").casefold()
+    return "".join(ch for ch in s if unicodedata.category(ch)[0] in "LMN")
+
+
+def _is_opener(text: str) -> bool:
+    """Opening bracket/quote: belongs to the line that FOLLOWS it."""
+    return bool(text) and unicodedata.category(text[0]) in ("Ps", "Pi")
+
+
+def _align_with(lines: list[str], words: list[Word],
+                key: Callable[[str], str], loose: bool) -> list[list[Word]]:
     pieces: list[list[Word]] = []
     i = 0
     for n, ln in enumerate(lines, 1):
-        target = _norm(ln)
+        target = key(ln)
         if not target:
             continue                      # ignore blank lines
         start = i
         while i < len(words):
-            cand = _norm(join_words(words[start:i + 1]))
+            cand = key(join_words(words[start:i + 1]))
             if cand == target:
-                pieces.append(words[start:i + 1])
                 i += 1
+                if loose:
+                    # punctuation has no key of its own: the line's trailing
+                    # marks stay with it, an opening quote goes to the next
+                    while (i < len(words) and not key(words[i].text)
+                           and not _is_opener(words[i].text)):
+                        i += 1
+                pieces.append(words[start:i])
                 break
             if len(cand) > len(target):
                 raise LLMSplitError(
@@ -476,11 +493,39 @@ def _align_lines(lines: list[str], words: list[Word]) -> list[list[Word]]:
         else:
             raise LLMSplitError(
                 "line mismatch: line %d ran past the end of the segment" % n)
+    if loose:
+        # trailing marks after the last line (e.g. a closing quote)
+        while i < len(words) and not key(words[i].text):
+            if pieces:
+                pieces[-1] = pieces[-1] + [words[i]]
+            i += 1
     if i != len(words):
         raise LLMSplitError(
             "line mismatch: lines do not cover the whole segment "
             "(%d words unclaimed)" % (len(words) - i))
     return pieces
+
+
+def _align_lines(lines: list[str], words: list[Word]) -> list[list[Word]]:
+    """Map the model's subtitle lines back onto contiguous word spans.
+
+    The prompt's hard constraint ("all lines concatenated == the source")
+    makes each line an exact substring of the token-glued text, so alignment
+    is deterministic: extend a candidate span word by word until its glued
+    text equals the line. A strict pass (whitespace-insensitive) runs first;
+    if the model only re-typed punctuation, width or case, a content-only
+    pass accepts it. Any real drift (a letter added, dropped or rewritten)
+    raises LLMSplitError (message carries the 'mismatch' retry marker) -- the
+    batch is retried with a corrective note, then degraded. Timestamps can
+    never be invented or lost here: pieces are always original word spans.
+    """
+    try:
+        return _align_with(lines, words, _norm, loose=False)
+    except LLMSplitError as strict_err:
+        try:
+            return _align_with(lines, words, _loose, loose=True)
+        except LLMSplitError:
+            raise strict_err from None
 
 
 _SUMMARY_SYSTEM_PROMPT = (
@@ -491,6 +536,7 @@ _SYSTEM_PROMPT = """你是字幕断句助手。输入是若干段语音转录文
 
 【硬性约束】
 - 不得增加、删除或改写任何字符；每段的所有行按顺序拼接后，必须与该段原文完全一致
+- 标点、全角/半角、大小写、省略号也必须照抄，不得替换、补全或规范化
 - 只调整断行位置，不得调换顺序、不得跨段拼接
 
 【断句原则】
@@ -809,41 +855,62 @@ class ProtocolSplitter:
             return None
         return min(self.e.max_output or _DEFAULT_MAX_OUTPUT_TOKENS, need)
 
-    def _choose_batch(self, batch: list[SplitTask],
-                      params: SegmentParams, summary: str) -> dict[int, list[list[Word]]]:
+    @staticmethod
+    def _user_prompt(tasks: list[SplitTask], summary: str) -> str:
         if summary:
             user = ("【全文摘要】:\n%s\n\n【当前文本块】:\n"
-                    "请断句以下 %d 段：\n" % (summary, len(batch)))
+                    "请断句以下 %d 段：\n" % (summary, len(tasks)))
         else:
-            user = "请断句以下 %d 段：\n" % len(batch)
-        for t in batch:
+            user = "请断句以下 %d 段：\n" % len(tasks)
+        for t in tasks:
             user += "\n[id=%d]\n%s\n" % (t.run_id, join_words(t.words))
-        by_id = {t.run_id: t for t in batch}
+        return user
 
+    def _choose_batch(self, batch: list[SplitTask],
+                      params: SegmentParams, summary: str) -> dict[int, list[list[Word]]]:
         system = _SYSTEM_PROMPT.format(min_chars=_TARGET_MIN_CHARS,
                                        max_chars=params.max_chars)
         cap = self._batch_cap(batch)
         error_note = ""
+        #: runs still without an aligned answer; a retry re-sends ONLY these,
+        #: so one stubborn run cannot cost the rest of its batch
+        pending = list(batch)
+        out: dict[int, list[list[Word]]] = {}
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            user = self._user_prompt(pending, summary)
             try:
                 # BOTH the request and the parse/align sit inside the retry
                 # loop: a retryable transport error must not escape early,
                 # and a malformed/misaligned reply gets a corrective note
                 content = _request(self.e, system + error_note, user,
                                    output_tokens=cap)
-                out: dict[int, list[list[Word]]] = {}
-                for rid, lines in self._parse(content).items():
-                    task = by_id.get(rid)
-                    if task is None:
-                        continue          # id the model invented/skipped
+                parsed = self._parse(content)
+                bad: list[str] = []
+                for t in pending:
+                    lines = parsed.get(t.run_id)
+                    if lines is None:
+                        bad.append("id=%d 回复里没有" % t.run_id)
+                        continue
                     try:
-                        out[rid] = _align_lines(lines, task.words)
+                        out[t.run_id] = _align_lines(lines, t.words)
                     except LLMSplitError as e:
-                        self._log("段 id=%d 对齐失败：%s" % (rid, e))
+                        self._log("段 id=%d 对齐失败：%s" % (t.run_id, e))
+                        bad.append("id=%d %s" % (t.run_id, e))
+                pending = [t for t in pending if t.run_id not in out]
+                if not pending:
+                    return out
                 if not out:
                     raise LLMSplitError(
                         "reply had no alignable lines for this batch (mismatch)")
-                return out
+                if attempt >= _MAX_ATTEMPTS:
+                    return out            # partial: the rest degrades upstream
+                self._log("%d 段未能对齐，只重发这几段（第 %d/%d 次）"
+                          % (len(pending), attempt + 1, _MAX_ATTEMPTS))
+                error_note = ("\n上次输出中有的段无法逐字对应原文（%s），请逐字"
+                              "保留原文（含标点、全角/半角、大小写），只调整断行"
+                              "位置，并严格只返回规定格式的 JSON。"
+                              % "; ".join(bad)[:300])
+                continue
             except LLMSplitError as e:
                 msg = str(e)
                 # thinking-form rejection first (its message can also name
@@ -892,6 +959,8 @@ class ProtocolSplitter:
                               "把分批收紧到 %d 字" % (msg[:80], self._cap_chars))
                     continue
                 if attempt >= _MAX_ATTEMPTS or not _is_retryable_error(msg):
+                    if out:
+                        return out        # keep what already aligned
                     raise
                 low = msg.lower()
                 if ("reply" in low or "json" in low or "mismatch" in low):
