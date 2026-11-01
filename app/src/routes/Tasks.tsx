@@ -25,10 +25,10 @@ const KIND_ICON: Record<JobKind, typeof AudioLines> = {
 };
 
 const STATUS_STYLE: Record<JobStatus, { label: Key; cls: string }> = {
-  running: { label: 'k.st.running', cls: 'bg-(--primary-dim) text-primary' },
+  running: { label: 'k.st.running', cls: 'bg-primary-dim text-primary' },
   done: { label: 'k.st.done', cls: 'bg-ok/12 text-ok' },
   error: { label: 'k.st.error', cls: 'bg-err/12 text-err' },
-  cancelled: { label: 'k.st.cancelled', cls: 'bg-(--hover) text-ink-2' },
+  cancelled: { label: 'k.st.cancelled', cls: 'bg-hover text-ink-2' },
 };
 
 const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p;
@@ -96,7 +96,7 @@ export function TasksPage() {
 
       {jobs.length === 0 ? (
         <Card className="flex min-h-[220px] flex-col items-center justify-center gap-3 p-10 text-center">
-          <span className="grid h-12 w-12 place-items-center rounded-(--radius-l) bg-(--primary-dim) text-primary">
+          <span className="grid h-12 w-12 place-items-center rounded-(--radius-l) bg-primary-dim text-primary">
             <ListChecks size={22} strokeWidth={1.8} />
           </span>
           <p className="max-w-md text-[13px] text-ink-2">{t('k.empty')}</p>
@@ -150,7 +150,7 @@ function JobCard({ job: j, onFail }: { job: TrackedJob; onFail: (e: unknown) => 
     <Card className="flex flex-col gap-3 p-4">
       {/* header */}
       <div className="flex items-center gap-3">
-        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-(--radius-s) bg-(--primary-dim) text-primary">
+        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-(--radius-s) bg-primary-dim text-primary">
           <Icon size={16} strokeWidth={2} />
         </span>
         <div className="min-w-0 flex-1">
@@ -301,7 +301,7 @@ function JobCard({ job: j, onFail }: { job: TrackedJob; onFail: (e: unknown) => 
                     key={k}
                     onClick={() => setTab(k)}
                     className={`rounded-(--radius-s) px-2.5 py-1 text-[12px] font-medium transition-colors ${
-                      tab === k ? 'bg-(--primary-dim) text-primary' : 'text-ink-3 hover:bg-(--hover) hover:text-ink-1'
+                      tab === k ? 'bg-primary-dim text-primary' : 'text-ink-3 hover:bg-hover hover:text-ink-1'
                     }`}
                   >
                     {t(k === 'files' ? 'k.files' : 'k.log')}
