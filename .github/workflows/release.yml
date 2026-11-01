@@ -76,8 +76,8 @@ jobs:
             build-essential curl wget file libxdo-dev libssl-dev \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
             patchelf xdg-utils libfuse2 ffmpeg \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good
 
       - name: Install backend + PyInstaller
         run: pip install -e ".[dev]" pyinstaller
