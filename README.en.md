@@ -156,6 +156,8 @@ FFmpeg is bundled with the installer — you do **not** need to install it yours
 5. To make the segmentation finer, click "refine subtitles" to open the Refine page and edit, merge, delete or split as needed. You can listen while you adjust, and clicking a line jumps to that cue
 6. When you are happy, press "save .srt" — it writes `<name>_refined.srt` next to the original audio/video, leaving the earlier `.srt` untouched
 
+**Several files at once:** drop or pick more than one audio/video file and the page turns into a queue — remove files you do not want, press "transcribe N files", and each row shows its own status (waiting / running / done / skipped / failed, with the reason for a failure). Files that already have a transcript and subtitles are skipped, so after a failure "retry failed" simply runs the batch again. A batch uses one browser session and goes through the files one at a time; the command-line equivalent is [`mai2srt batch`](#batch-transcription).
+
 If you drop a `.mai.json` instead of media, the button becomes "generate subtitles": transcription is skipped and only the segmentation runs again. That spends no transcription quota and is the right path for tuning.
 
 | Shortcut | Action |

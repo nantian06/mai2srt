@@ -11,6 +11,11 @@
 - 单个文件失败不影响其余文件；未登录、会话过期、生物特征通知（HTTP 451）、没有可用浏览器这类全局问题会立即中止整批并给出处理办法。
 - `--dry-run` 只列出计划，`--report` 输出 JSON 汇总，结束时打印汇总表；有失败则退出码非 0，Ctrl-C 退出码 130。
 
+## 桌面应用：批量队列
+
+- 转录页同时拖入 / 选择多个文件即变为队列：开始前可移除单个文件，运行中逐行显示状态与失败原因，结束后有汇总与「重试失败项」。只选一个文件时界面不变。
+- V1 不支持队列重排、暂停与单项取消（取消即取消整批）。
+
 ## Linux
 
 - 后端与 CLI 可在 Linux 上从源码运行：自动探测 Google Chrome / Microsoft Edge / 发行版 chromium，找不到时回退到 playwright 自带 chromium；FFmpeg 走 `PATH`，缺失时给出 apt / dnf / pacman 安装提示。
@@ -31,6 +36,11 @@ Adds a batch transcription command and Linux support (CLI / from source). The Wi
 - Re-runnable: files with both a transcript and an `.srt` are skipped; files with only a transcript are just re-segmented, never uploaded again. `--overwrite` redoes everything.
 - A failing file does not stop the others; problems that would sink every file — not signed in, an expired session, the biometric notice (HTTP 451), no usable browser — abort the batch at once with the fix.
 - `--dry-run` lists the plan, `--report` writes a JSON summary, and a summary table is printed at the end; the exit code is non-zero if anything failed (130 on Ctrl-C).
+
+## Desktop app: batch queue
+
+- Dropping or picking several files on the Transcribe page turns it into a queue: remove files before starting, see each row's status and failure reason while it runs, get a summary and "retry failed" afterwards. A single file keeps the old screen.
+- No reordering, pausing or per-file cancel yet (cancel stops the whole batch).
 
 ## Linux
 
