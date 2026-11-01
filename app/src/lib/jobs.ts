@@ -232,9 +232,16 @@ export function trackJob(info: JobSummary, live = true): TrackedJob {
   // ids restart at 1 with a new backend process: same id, other job
   const stale = known && info.created_at
     && Math.abs(known.createdAt - info.created_at * 1000) > 1;
-  if (known && !stale) return known;
+  // recover() gave up on it (backend unreachable too long) yet the backend
+  // lists it again: rebuild it from the full history instead of leaving it
+  // lost. It restarts as running so the replayed terminal event settles it
+  // (and notifies) with its real outcome.
+  const orphaned = known && !stale && known.lost && !streams.has(info.id);
+  if (known && !stale && !orphaned) return known;
   if (stale) { streams.get(info.id)?.es?.close(); streams.delete(info.id); }
-  const job = fromSummary(info, live);
+  const job = orphaned
+    ? { ...fromSummary(info, known.live), status: 'running' as const }
+    : fromSummary(info, live);
   jobs.set(job.id, job);
   streams.set(job.id, { es: null, seen: 0, retries: 0 });
   open(job.id);
