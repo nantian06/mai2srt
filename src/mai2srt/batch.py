@@ -1,11 +1,27 @@
 """Batch transcription: many media files, one browser session.
 
-Shared by the CLI (``mai2srt batch``) and, later, the UI server. The shape is
+Shared by the CLI (``mai2srt batch``) and the UI server. The shape is
 deliberately split in two so a ``--dry-run`` is just "plan, print, stop":
 
     plan_batch()  -> [BatchItem]   pure decisions: what to transcribe, what to
                                    only re-segment, what is already done
-    run_batch()   -> BatchReport   executes the plan, one shared browser
+    BatchQueue    -> BatchReport   executes the plan, one shared browser
+    run_batch()                    (the same, for a fixed list)
+
+Execution is a three-stage pipeline, because each stage spends a different
+resource and a file used to hold all three while the others sat idle:
+
+    prepare (local ffmpeg) -> upload (playground) -> segment (LLM API)
+
+Each stage has its own workers: one preparer that runs at most PREFETCH file
+ahead of the uploads (prepared pieces sit on disk), ``jobs`` uploaders sharing
+the browser page, and ``llm_jobs`` segmenters. While file 1 is being
+segmented, file 2 uploads and file 3 is prepared. Files that only need
+re-segmenting skip straight to the last stage.
+
+The queue stays open while it has work: the UI appends files to a running
+batch (``BatchQueue.add``), removes ones that have not started yet, or
+re-queues a finished one. It closes once every file has settled.
 
 Error policy (decided with the user, see the design notes in the PR):
 
@@ -16,11 +32,14 @@ Error policy (decided with the user, see the design notes in the PR):
   way, and the message says how to fix it;
 * a file whose transcript already exists but whose SRT does not is only
   re-segmented: the upload is the slow, quota-consuming step and is never
-  repeated needlessly.
+  repeated needlessly;
+* after a global error, files already uploaded still get their subtitles:
+  only the files that would need the playground are cancelled.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -30,7 +49,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import storage
-from .config import Config, projects_dir
+from .config import MAX_LLM_JOBS, Config, projects_dir
 from .postprocess import PostprocessParams
 from .segment import SegmentParams
 from .transcribe.browser import NoDisplayError
@@ -46,6 +65,11 @@ MEDIA_EXTS = frozenset(AUDIO_EXTS + VIDEO_EXTS)
 
 #: parallel uploads share one account and one browser; keep the ceiling low
 MAX_JOBS = 3
+#: MAX_LLM_JOBS (from config): files segmented at the same time, each its
+#: own run of LLM calls
+#: how many files may be prepared ahead of the uploads (their encoded pieces
+#: wait on disk, so this also bounds the temporary space a batch uses)
+PREFETCH = 1
 
 # action: what the plan intends for a file
 ACT_TRANSCRIBE = "transcribe"   # upload + segment + export
@@ -59,6 +83,15 @@ ST_DONE = "done"
 ST_SKIPPED = "skipped"
 ST_FAILED = "failed"
 ST_CANCELLED = "cancelled"
+#: taken out of a running queue before it started (UI only)
+ST_REMOVED = "removed"
+
+# phase: where a running file is in the pipeline ("" when not running)
+PH_PREPARE = "prepare"
+PH_WAIT_UPLOAD = "wait_upload"
+PH_UPLOAD = "upload"
+PH_WAIT_SEGMENT = "wait_segment"
+PH_SEGMENT = "segment"
 
 
 class BatchAborted(RuntimeError):
@@ -79,12 +112,18 @@ class BatchItem:
     entries: int = 0
     dialogue: int = 0
     seconds: float = 0.0
+    #: stable position in the queue: survives removals and appends
+    index: int = -1
+    #: where a running file is in the pipeline (PH_*); "" otherwise
+    phase: str = ""
+    started_at: float = field(default=0.0, repr=False)
 
     def to_dict(self) -> dict:
         return {
+            "index": self.index,
             "audio": str(self.audio), "srt": str(self.srt),
             "json": str(self.json_path), "action": self.action,
-            "status": self.status, "detail": self.detail,
+            "status": self.status, "phase": self.phase, "detail": self.detail,
             "llm_note": self.llm_note, "words": self.words,
             "entries": self.entries, "dialogue": self.dialogue,
             "seconds": round(self.seconds, 1),
@@ -178,7 +217,8 @@ def _short_hash(audio: Path) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:6]
 
 
-def _srt_targets(audios: list[Path], out_dir: Path | None) -> list[Path]:
+def _srt_targets(audios: list[Path], out_dir: Path | None,
+                 taken: set[str] | None = None) -> list[Path]:
     """One SRT path per input; never two inputs onto the same file.
 
     Default: next to each audio (a collision is impossible there -- two
@@ -187,6 +227,8 @@ def _srt_targets(audios: list[Path], out_dir: Path | None) -> list[Path]:
     files from different places collide. EVERY member of a colliding group
     gets a short path hash (``clip-3fa9c1.srt``), not just the later ones, so
     the names do not depend on which file happened to be listed first.
+    ``taken``: SRT paths a running queue already promised to other files; a
+    file appended later that would land on one is hashed the same way.
     """
     def raw(a: Path) -> Path:
         return (out_dir if out_dir else a.parent) / (a.stem + ".srt")
@@ -195,8 +237,8 @@ def _srt_targets(audios: list[Path], out_dir: Path | None) -> list[Path]:
     for i, a in enumerate(audios):
         groups.setdefault(os.path.normcase(str(raw(a))), []).append(i)
     targets = [raw(a) for a in audios]
-    for idxs in groups.values():
-        if len(idxs) > 1:
+    for k, idxs in groups.items():
+        if len(idxs) > 1 or (taken and k in taken):
             for i in idxs:
                 a = audios[i]
                 targets[i] = raw(a).with_name("%s-%s.srt" % (a.stem, _short_hash(a)))
@@ -217,55 +259,68 @@ def _srt_is_current(srt: Path, transcript: Path) -> bool:
         return False
 
 
+def _action_for(project: Path | None, srt: Path, overwrite: bool
+                ) -> tuple[str, str]:
+    """(action, reason) for one file, given its transcript (if any)."""
+    if overwrite:
+        return ACT_TRANSCRIBE, "--overwrite"
+    if project is not None and _srt_is_current(srt, project):
+        return ACT_SKIP, "already done (transcript + %s)" % srt.name
+    if project is not None:
+        return ACT_RESEGMENT, (
+            "transcript exists, SRT missing" if not srt.exists()
+            else "transcript is newer than %s" % srt.name)
+    if srt.exists():
+        return ACT_TRANSCRIBE, "no transcript; will replace existing %s" % srt.name
+    return ACT_TRANSCRIBE, "new"
+
+
 def plan_batch(cfg: Config, audios: list[Path], out_dir: Path | None = None,
-               overwrite: bool = False) -> list[BatchItem]:
+               overwrite: bool = False, *, reserved: set[str] | None = None,
+               taken_srts: set[str] | None = None,
+               first_index: int = 0) -> list[BatchItem]:
     """Decide, per file, whether to transcribe, re-segment or skip.
 
     Read-only: nothing is created on disk (the projects folder included), so
-    ``--dry-run`` leaves no trace.
+    ``--dry-run`` leaves no trace. ``reserved`` / ``taken_srts``: transcript
+    and SRT paths (normcased) a running queue already promised to its files,
+    so files appended to it never share one. Items are numbered from
+    ``first_index``.
     """
-    srts = _srt_targets(audios, out_dir)
+    srts = _srt_targets(audios, out_dir, taken_srts)
     lib = projects_dir(cfg)
-    reserved: set[str] = set()      # .mai.json paths already promised in this plan
 
     def key(p: Path) -> str:
         return os.path.normcase(str(p))
+
+    # .mai.json paths already promised in this plan (or by the running queue)
+    promised: set[str] = set(reserved or ())
 
     # existing projects first, so a new file's sibling name cannot take one
     existing: list[Path | None] = [storage.find_project(cfg, a) for a in audios]
     for p in existing:
         if p is not None:
-            reserved.add(key(p))
+            promised.add(key(p))
 
     items: list[BatchItem] = []
-    for audio, srt, project in zip(audios, srts, existing):
+    for n, (audio, srt, project) in enumerate(zip(audios, srts, existing)):
         if project is not None:
             json_path = project
         else:
             json_path = lib / (audio.stem + ".mai.json")
-            if key(json_path) in reserved or json_path.exists():
+            if key(json_path) in promised or json_path.exists():
                 # someone else's transcript (or an earlier file of this very
                 # batch) owns the name: number ours rather than clobber it
                 json_path = storage.unique_target(lib, audio.stem + ".mai.json")
-                while key(json_path) in reserved:
+                while key(json_path) in promised:
                     stem = json_path.name[: -len(".mai.json")]
                     json_path = lib / ("%s-%s.mai.json" % (stem, _short_hash(audio)))
-            reserved.add(key(json_path))
+            promised.add(key(json_path))
 
-        if overwrite:
-            action, reason = ACT_TRANSCRIBE, "--overwrite"
-        elif project is not None and _srt_is_current(srt, project):
-            action, reason = ACT_SKIP, "already done (transcript + %s)" % srt.name
-        elif project is not None:
-            action, reason = ACT_RESEGMENT, (
-                "transcript exists, SRT missing" if not srt.exists()
-                else "transcript is newer than %s" % srt.name)
-        elif srt.exists():
-            action, reason = ACT_TRANSCRIBE, "no transcript; will replace existing %s" % srt.name
-        else:
-            action, reason = ACT_TRANSCRIBE, "new"
+        action, reason = _action_for(project, srt, overwrite)
         items.append(BatchItem(audio=audio, srt=srt, json_path=json_path,
-                               action=action, reason=reason))
+                               action=action, reason=reason,
+                               index=first_index + n))
     return items
 
 
@@ -275,6 +330,8 @@ def plan_batch(cfg: Config, audios: list[Path], out_dir: Path | None = None,
 
 #: (index, total, item) -- a file is about to start / has just settled
 ItemCb = Callable[[int, int, BatchItem], None]
+#: (item,) -- a running file moved to another pipeline phase
+PhaseCb = Callable[[BatchItem], None]
 #: (item, stage, detail) / (item, line)
 ItemStageCb = Callable[[BatchItem, str, str], None]
 ItemLogCb = Callable[[BatchItem, str], None]
@@ -283,9 +340,404 @@ ItemLogCb = Callable[[BatchItem, str], None]
 #: logged, never the file's failure: its subtitles are already written.
 ResultCb = Callable[[BatchItem, object], None]
 
+SESSION_DEAD_MSG = (
+    "登录失效，批量已中止：请重新登录后再运行（已完成的文件会被跳过）"
+    " (session expired mid-batch; sign in again and re-run, "
+    "finished files are skipped)")
+
 
 def _noop(*_a, **_k) -> None:
     pass
+
+
+def _audio_key(p: Path) -> str:
+    return os.path.normcase(os.path.abspath(p))
+
+
+class BatchQueue:
+    """Runs a batch as a pipeline; files can be added while it runs.
+
+    The report is created by the caller and mutated as files settle, so a
+    Ctrl-C (CancelledError) still leaves an accurate partial summary behind.
+    A global error does not raise: it lands in ``report.aborted``.
+
+    Everything runs on one event loop: ``add`` / ``remove`` are plain calls
+    made from that loop, and a queue that has closed (all files settled)
+    refuses them, so a file is never added to a batch that already ended.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        report: BatchReport,
+        *,
+        keep: bool = False,
+        include_raw: bool = False,
+        segment_params: SegmentParams | None = None,
+        post_params: PostprocessParams | None = None,
+        use_llm: bool = True,
+        jobs: int = 1,
+        llm_jobs: int = 1,
+        out_dir: Path | None = None,
+        on_item_start: ItemCb = _noop,
+        on_item_done: ItemCb = _noop,
+        on_item_phase: PhaseCb = _noop,
+        on_stage: ItemStageCb = _noop,
+        on_log: ItemLogCb = _noop,
+        on_result: ResultCb = _noop,
+        on_consent=None,
+    ) -> None:
+        self.cfg = cfg
+        self.report = report
+        self.keep = keep
+        self.include_raw = include_raw
+        self.segment_params = segment_params
+        self.post_params = post_params
+        self.use_llm = use_llm
+        self.jobs = max(1, min(int(jobs), MAX_JOBS))
+        self.llm_jobs = max(1, min(int(llm_jobs), MAX_LLM_JOBS))
+        self.out_dir = out_dir
+        self.on_item_start = on_item_start
+        self.on_item_done = on_item_done
+        self.on_item_phase = on_item_phase
+        self.on_stage = on_stage
+        self.on_log = on_log
+        self.on_result = on_result
+        self.on_consent = on_consent
+
+        self._prep_q: asyncio.Queue = asyncio.Queue()
+        self._upload_q: asyncio.Queue = asyncio.Queue()
+        self._seg_q: asyncio.Queue = asyncio.Queue()
+        # a slot is held from the start of a file's preparation until its
+        # upload ends: at most `jobs` uploading + PREFETCH prepared ahead
+        self._slots = asyncio.Semaphore(self.jobs + PREFETCH)
+        self._outstanding = 0
+        self._done = asyncio.Event()
+        self._closed = False
+        self._stop_uploads = False
+        self._page = None
+        self._page_lock = asyncio.Lock()
+        self._stack = contextlib.AsyncExitStack()
+        self._next_index = 0
+        for it in report.items:
+            if it.index < 0:
+                it.index = self._next_index
+            self._next_index = max(self._next_index, it.index + 1)
+            self._admit(it)
+
+    # -------------------------------------------------------------- public
+
+    @property
+    def closed(self) -> bool:
+        """No more files are accepted (all settled, aborted or stopped)."""
+        return self._closed or self.report.aborted is not None
+
+    def add(self, audios: list[Path], overwrite: bool = False
+            ) -> list[BatchItem] | None:
+        """Append files to the running queue; None when it has closed.
+
+        Returns the items that will run (or were settled at once as skipped):
+        new files, plus files already in the queue that are re-queued -- a
+        failed or cancelled one always, a finished or skipped one only with
+        ``overwrite``. A file still waiting or running is left alone.
+        """
+        if self.closed:
+            return None
+        by_key = {_audio_key(it.audio): it for it in self.report.items}
+        touched: list[BatchItem] = []
+        fresh: list[Path] = []
+        seen: set[str] = set()
+        for a in audios:
+            k = _audio_key(a)
+            if k in seen:
+                continue
+            seen.add(k)
+            it = by_key.get(k)
+            if it is None:
+                fresh.append(Path(os.path.abspath(a)))
+            elif it.status in (ST_PENDING, ST_RUNNING):
+                continue
+            elif overwrite or it.status in (ST_FAILED, ST_CANCELLED):
+                self._requeue(it, overwrite)
+                touched.append(it)
+        if fresh:
+            items = plan_batch(
+                self.cfg, fresh, out_dir=self.out_dir, overwrite=overwrite,
+                reserved={os.path.normcase(str(i.json_path)) for i in self.report.items},
+                taken_srts={os.path.normcase(str(i.srt)) for i in self.report.items},
+                first_index=self._next_index)
+            for it in items:
+                self._next_index = it.index + 1
+                self.report.items.append(it)
+                self._admit(it)
+                touched.append(it)
+        return touched
+
+    def remove(self, index: int) -> BatchItem | None:
+        """Take a file that has not started yet out of the queue."""
+        it = next((i for i in self.report.items if i.index == index), None)
+        if it is None or it.status != ST_PENDING or self._closed:
+            return None
+        it.status = ST_REMOVED          # the stage queues skip it
+        self.report.items.remove(it)
+        self._finish_one()
+        return it
+
+    async def run(self) -> BatchReport:
+        if self._outstanding == 0:
+            self._closed = True
+            return self.report
+        workers = [asyncio.ensure_future(self._prepare_worker())]
+        workers += [asyncio.ensure_future(self._upload_worker())
+                    for _ in range(self.jobs)]
+        workers += [asyncio.ensure_future(self._segment_worker())
+                    for _ in range(self.llm_jobs)]
+        waiter = asyncio.ensure_future(self._done.wait())
+        try:
+            done, _ = await asyncio.wait(
+                [waiter, *workers], return_when=asyncio.FIRST_COMPLETED)
+            if waiter not in done:
+                # a worker died: a bug, never a file's failure (those are
+                # caught per file) -- surface it instead of hanging forever
+                crashed = next(t for t in workers if t in done)
+                raise crashed.exception() or RuntimeError("batch worker stopped")
+        except BaseException as e:
+            if isinstance(e, asyncio.CancelledError):
+                self.report.interrupted = True
+            for it in self.report.items:
+                if it.status in (ST_RUNNING, ST_PENDING):
+                    it.status = ST_CANCELLED
+                    it.phase = ""
+            raise
+        finally:
+            self._closed = True
+            waiter.cancel()
+            for t in workers:
+                t.cancel()
+            await asyncio.gather(waiter, *workers, return_exceptions=True)
+            while not self._upload_q.empty():
+                _it, prepared = self._upload_q.get_nowait()
+                prepared.cleanup()
+            try:
+                await self._stack.aclose()
+            except Exception as e:  # noqa: BLE001 -- closing the browser
+                log.warning("closing the batch browser session failed: %s", e)
+        return self.report
+
+    # ------------------------------------------------------------ bookkeeping
+
+    def _admit(self, it: BatchItem) -> None:
+        it.phase = ""
+        if it.action == ACT_SKIP:
+            it.status = ST_SKIPPED
+            it.detail = it.reason
+            return
+        it.status = ST_PENDING
+        self._outstanding += 1
+        if it.action == ACT_RESEGMENT:
+            self._seg_q.put_nowait((it, None))
+        else:
+            self._prep_q.put_nowait(it)
+
+    def _requeue(self, it: BatchItem, overwrite: bool) -> None:
+        project = it.json_path if it.json_path.exists() else None
+        it.action, it.reason = _action_for(project, it.srt, overwrite)
+        it.detail, it.llm_note = "", None
+        it.words = it.entries = it.dialogue = 0
+        it.seconds = 0.0
+        self._admit(it)
+
+    def _total(self) -> int:
+        return len(self.report.items)
+
+    def _start(self, it: BatchItem) -> None:
+        it.status = ST_RUNNING
+        it.started_at = time.monotonic()
+        self.on_item_start(it.index, self._total(), it)
+
+    def _set_phase(self, it: BatchItem, phase: str) -> None:
+        it.phase = phase
+        self.on_item_phase(it)
+
+    def _settle(self, it: BatchItem) -> None:
+        it.phase = ""
+        if it.started_at:
+            it.seconds = time.monotonic() - it.started_at
+        self.on_item_done(it.index, self._total(), it)
+        self._finish_one()
+
+    def _finish_one(self) -> None:
+        self._outstanding -= 1
+        if self._outstanding <= 0:
+            self._closed = True
+            self._done.set()
+
+    def _fail(self, it: BatchItem, e: BaseException) -> None:
+        it.status = ST_FAILED
+        it.detail = str(e) or type(e).__name__
+        self._settle(it)
+
+    def _cancel(self, it: BatchItem, why: str) -> None:
+        it.status = ST_CANCELLED
+        it.detail = why
+        self._settle(it)
+
+    def _succeed(self, it: BatchItem, res) -> None:
+        it.status = ST_DONE
+        it.words, it.entries = res.words, res.entries
+        it.dialogue, it.llm_note = res.dialogue, res.llm_note
+        try:
+            self.on_result(it, res)
+        except Exception as e:  # noqa: BLE001
+            log.warning("post-processing %s failed: %s", it.audio.name, e)
+        self._settle(it)
+
+    def _abort(self, msg: str) -> None:
+        """A global problem: nothing more goes to the playground.
+
+        Files waiting for preparation or upload are cancelled; files already
+        uploaded keep going through segmentation, so their subtitles (and
+        the upload they cost) are not thrown away.
+        """
+        if self.report.aborted is None:
+            self.report.aborted = msg
+        self._stop_uploads = True
+        while not self._prep_q.empty():
+            it = self._prep_q.get_nowait()
+            if it.status == ST_PENDING:
+                self._cancel(it, "batch aborted")
+        while not self._upload_q.empty():
+            it, prepared = self._upload_q.get_nowait()
+            prepared.cleanup()
+            self._slots.release()
+            self._cancel(it, "batch aborted")
+
+    def _cbs(self, it: BatchItem) -> dict:
+        return {"on_stage": lambda s, d: self.on_stage(it, s, d),
+                "on_log": lambda m: self.on_log(it, m)}
+
+    async def _get_page(self):
+        """The shared playground page, opened on first use.
+
+        Lazily: a queue that only re-segments never starts a browser, and one
+        that gains an upload later starts it then.
+        """
+        async with self._page_lock:
+            if self._stop_uploads:
+                raise BatchAborted(self.report.aborted or "batch aborted")
+            if self._page is None:
+                from . import runner
+                try:
+                    self._page = await self._stack.enter_async_context(
+                        runner.browser_session(
+                            self.cfg, lambda m: self.on_log(_BATCH_ITEM, m)))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 -- not signed in, no
+                    # browser, no display: every upload would fail the same way
+                    raise BatchAborted(str(e) or type(e).__name__) from e
+            return self._page
+
+    # ----------------------------------------------------------------- stages
+
+    async def _prepare_worker(self) -> None:
+        from . import runner
+        while True:
+            it = await self._prep_q.get()
+            if it.status != ST_PENDING:
+                continue                    # removed while it waited
+            await self._slots.acquire()
+            if it.status != ST_PENDING or self._stop_uploads:
+                self._slots.release()
+                if it.status == ST_PENDING:
+                    self._cancel(it, "batch aborted")
+                continue
+            self._start(it)
+            self._set_phase(it, PH_PREPARE)
+            try:
+                prepared = await runner.prepare_media(self.cfg, it.audio,
+                                                      **self._cbs(it))
+            except asyncio.CancelledError:
+                self._slots.release()
+                raise
+            except Exception as e:  # noqa: BLE001 -- bad media is one file's failure
+                self._slots.release()
+                self._fail(it, e)
+                continue
+            if self._stop_uploads:
+                prepared.cleanup()
+                self._slots.release()
+                self._cancel(it, "batch aborted")
+                continue
+            self._set_phase(it, PH_WAIT_UPLOAD)
+            self._upload_q.put_nowait((it, prepared))
+
+    async def _upload_worker(self) -> None:
+        from . import runner
+        from .runner import AuthRequired
+        from .transcribe import browser
+        while True:
+            it, prepared = await self._upload_q.get()
+            try:
+                if self._stop_uploads:
+                    self._cancel(it, "batch aborted")
+                    continue
+                self._set_phase(it, PH_UPLOAD)
+                page = None
+                try:
+                    page = await self._get_page()
+                    transcribed = await runner.transcribe_prepared(
+                        self.cfg, prepared, it.json_path, keep=self.keep,
+                        include_raw=self.include_raw,
+                        on_consent=self.on_consent, page=page, **self._cbs(it))
+                except asyncio.CancelledError:
+                    raise
+                except BatchAborted as e:
+                    self._abort(str(e))
+                    self._cancel(it, "batch aborted")
+                    continue
+                except (BiometricConsentRequired, AuthRequired, NoDisplayError) as e:
+                    self._fail(it, e)
+                    self._abort(str(e))
+                    continue
+                except Exception as e:  # noqa: BLE001 -- one file's failure, whatever its type
+                    self._fail(it, e)
+                    # a per-file failure that is really "the session died":
+                    # probe it (cheap) so the rest does not fail 40 times over
+                    if page is not None and await _session_dead(page, self.cfg, browser):
+                        self._abort(SESSION_DEAD_MSG)
+                    continue
+            finally:
+                prepared.cleanup()
+                self._slots.release()
+            self._set_phase(it, PH_WAIT_SEGMENT)
+            self._seg_q.put_nowait((it, transcribed))
+
+    async def _segment_worker(self) -> None:
+        from . import runner
+        while True:
+            it, transcribed = await self._seg_q.get()
+            if it.status not in (ST_PENDING, ST_RUNNING):
+                continue                    # removed while it waited
+            if it.status == ST_PENDING:
+                self._start(it)             # a re-segment-only file
+            self._set_phase(it, PH_SEGMENT)
+            kw = dict(segment_params=self.segment_params,
+                      post_params=self.post_params, use_llm=self.use_llm,
+                      **self._cbs(it))
+            try:
+                if transcribed is None:
+                    res = await runner.resegment_existing(
+                        self.cfg, it.json_path, it.srt, **kw)
+                else:
+                    res = await runner.segment_transcribed(
+                        self.cfg, transcribed, it.srt, **kw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self._fail(it, e)
+                continue
+            self._succeed(it, res)
 
 
 async def run_batch(
@@ -298,132 +750,27 @@ async def run_batch(
     post_params: PostprocessParams | None = None,
     use_llm: bool = True,
     jobs: int = 1,
+    llm_jobs: int = 1,
     on_item_start: ItemCb = _noop,
     on_item_done: ItemCb = _noop,
+    on_item_phase: PhaseCb = _noop,
     on_stage: ItemStageCb = _noop,
     on_log: ItemLogCb = _noop,
     on_result: ResultCb = _noop,
     on_consent=None,
 ) -> BatchReport:
-    """Execute ``report.items`` in place; returns ``report``.
+    """Execute ``report.items`` in place (a fixed list); returns ``report``.
 
-    The report is created by the caller and mutated as files settle, so a
-    Ctrl-C (CancelledError) still leaves an accurate partial summary behind.
-    A global error does not raise: it lands in ``report.aborted``.
+    ``jobs``: parallel uploads (capped at MAX_JOBS); ``llm_jobs``: files
+    segmented at the same time (capped at MAX_LLM_JOBS).
     """
-    from .runner import AuthRequired, browser_session, resegment_existing, run_full
-    from .transcribe import browser
-
-    jobs = max(1, min(int(jobs), MAX_JOBS))
-    total = len(report.items)
-    todo = [(i, it) for i, it in enumerate(report.items)
-            if it.action != ACT_SKIP]
-    for it in report.items:
-        if it.action == ACT_SKIP:
-            it.status = ST_SKIPPED
-            it.detail = it.reason
-
-    async def one(idx: int, item: BatchItem, page) -> None:
-        item.status = ST_RUNNING
-        on_item_start(idx, total, item)
-        t0 = time.monotonic()
-        cb_stage = lambda s, d: on_stage(item, s, d)  # noqa: E731
-        cb_log = lambda m: on_log(item, m)            # noqa: E731
-        try:
-            if item.action == ACT_RESEGMENT:
-                res = await resegment_existing(
-                    cfg, item.json_path, item.srt,
-                    segment_params=segment_params, post_params=post_params,
-                    use_llm=use_llm, on_stage=cb_stage, on_log=cb_log)
-            else:
-                res = await run_full(
-                    cfg, item.audio, json_path=item.json_path,
-                    keep=keep, include_raw=include_raw,
-                    segment_params=segment_params, post_params=post_params,
-                    use_llm=use_llm, on_stage=cb_stage, on_log=cb_log,
-                    on_consent=on_consent, page=page, srt_path=item.srt)
-            item.status = ST_DONE
-            item.words, item.entries = res.words, res.entries
-            item.dialogue, item.llm_note = res.dialogue, res.llm_note
-            try:
-                on_result(item, res)
-            except Exception as e:  # noqa: BLE001
-                log.warning("post-processing %s failed: %s", item.audio.name, e)
-        except asyncio.CancelledError:
-            item.status = ST_CANCELLED
-            raise
-        except BiometricConsentRequired as e:
-            item.status, item.detail = ST_FAILED, str(e)
-            raise BatchAborted(str(e)) from e
-        except (AuthRequired, NoDisplayError) as e:
-            item.status, item.detail = ST_FAILED, str(e)
-            raise BatchAborted(str(e)) from e
-        except Exception as e:  # noqa: BLE001 -- one file's failure, whatever its type
-            item.status = ST_FAILED
-            item.detail = str(e) or type(e).__name__
-            # a per-file failure that is really "the session died": probe it
-            # (cheap) so the rest of the batch does not fail 40 times over
-            if page is not None and item.action == ACT_TRANSCRIBE:
-                if await _session_dead(page, cfg, browser):
-                    raise BatchAborted(
-                        "登录失效，批量已中止：请重新登录后再运行（已完成的文件会被跳过）"
-                        " (session expired mid-batch; sign in again and re-run, "
-                        "finished files are skipped)") from e
-        finally:
-            item.seconds = time.monotonic() - t0
-            on_item_done(idx, total, item)
-
-    async def drive(page) -> None:
-        queue: asyncio.Queue = asyncio.Queue()
-        for pair in todo:
-            queue.put_nowait(pair)
-
-        async def worker() -> None:
-            while True:
-                try:
-                    idx, item = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                await one(idx, item, page)
-
-        tasks = [asyncio.ensure_future(worker()) for _ in range(jobs)]
-        try:
-            await asyncio.gather(*tasks)
-        except BaseException:
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-
-    try:
-        if any(it.action == ACT_TRANSCRIBE for _, it in todo):
-            # the browser is only started when something actually needs an
-            # upload: a resume that merely re-segments has no use for one
-            try:
-                async with browser_session(cfg, lambda m: on_log(_BATCH_ITEM, m)) as page:
-                    await drive(page)
-            except BatchAborted:
-                raise
-            except (AuthRequired, NoDisplayError) as e:
-                raise BatchAborted(str(e)) from e
-            except RuntimeError as e:       # no usable browser could be launched
-                raise BatchAborted(str(e)) from e
-        else:
-            await drive(None)
-    except BatchAborted as e:
-        report.aborted = str(e)
-    except asyncio.CancelledError:
-        report.interrupted = True
-        for it in report.items:
-            if it.status in (ST_RUNNING, ST_PENDING):
-                it.status = ST_CANCELLED
-        raise
-    if report.aborted:
-        for it in report.items:
-            if it.status == ST_PENDING:
-                it.status = ST_CANCELLED
-                it.detail = "batch aborted"
-    return report
+    return await BatchQueue(
+        cfg, report, keep=keep, include_raw=include_raw,
+        segment_params=segment_params, post_params=post_params,
+        use_llm=use_llm, jobs=jobs, llm_jobs=llm_jobs,
+        on_item_start=on_item_start, on_item_done=on_item_done,
+        on_item_phase=on_item_phase, on_stage=on_stage, on_log=on_log,
+        on_result=on_result, on_consent=on_consent).run()
 
 
 #: placeholder item for log lines that belong to the batch, not to a file

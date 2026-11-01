@@ -9,7 +9,8 @@
     mai2srt run <audio> [--out out.srt] [--json out.mai.json] [--no-llm]
               [tuning flags]
     mai2srt batch <file|dir>... [-r] [--out-dir D] [--overwrite] [--dry-run]
-              [--jobs N] [--report r.json] [--no-llm] [tuning flags]
+              [--jobs N] [--llm-jobs N] [--report r.json] [--no-llm]
+              [tuning flags]
 
 Speaker diarization cannot be disabled: the playground server ignores
 {"diarize": false} entirely (live-verified 2026-09-26 -- an empty
@@ -248,6 +249,8 @@ def cmd_batch(cfg: Config, args: argparse.Namespace) -> int:
             return 1
 
     sp, pp = _tuned_params(args)
+    from .config import llm_jobs as stored_llm_jobs
+    llm_jobs = args.llm_jobs if args.llm_jobs is not None else stored_llm_jobs(cfg)
     report = b.BatchReport(items, input_problems=list(problems))
     order = {id(it): n for n, it in enumerate(items, 1)}
     total = len(items)
@@ -272,7 +275,8 @@ def cmd_batch(cfg: Config, args: argparse.Namespace) -> int:
             cfg, report,
             keep=_resolve_keep(cfg, args), include_raw=args.include_raw,
             segment_params=sp, post_params=pp, use_llm=not args.no_llm,
-            jobs=args.jobs, on_item_start=started, on_item_done=finished,
+            jobs=args.jobs, llm_jobs=llm_jobs,
+            on_item_start=started, on_item_done=finished,
             on_log=on_log, on_consent=_consent_prompt)
 
     interrupted = False
@@ -402,7 +406,12 @@ def main(argv: list[str] | None = None) -> int:
                          "and exit; uploads nothing, creates nothing")
     bp.add_argument("--jobs", type=int, default=1,
                     help="parallel uploads (default 1, max 3; the playground "
-                         "is a free shared service - raise with care)")
+                         "is a free shared service - raise with care). The "
+                         "next file is always prepared, and the previous one "
+                         "segmented, while one uploads")
+    bp.add_argument("--llm-jobs", type=int, default=None,
+                    help="files segmented by the LLM at the same time "
+                         "(default: the app setting, 1; max 4)")
     bp.add_argument("--report", default=None,
                     help="also write a machine-readable JSON report here")
     bp.add_argument("--keep-conversation", action="store_true", default=None)

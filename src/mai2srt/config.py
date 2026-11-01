@@ -403,6 +403,30 @@ def set_auto_delete_conversation(cfg: Config, on: bool) -> None:
     save_app_config(cfg, data)
 
 
+# ---------------------------------------------------------------------------
+# batch pipeline: how many files are segmented (LLM) at the same time. One by
+# default -- rate-limited endpoints and local models do not like parallel
+# runs; the user raises it in the LLM settings (the CLI's --llm-jobs default).
+# ---------------------------------------------------------------------------
+
+MAX_LLM_JOBS = 4
+
+
+def llm_jobs(cfg: Config) -> int:
+    v = load_app_config(cfg).get("llm_jobs")
+    if isinstance(v, bool) or not isinstance(v, int):
+        return 1
+    return max(1, min(v, MAX_LLM_JOBS))
+
+
+def set_llm_jobs(cfg: Config, n: int) -> int:
+    n = max(1, min(int(n), MAX_LLM_JOBS))
+    data = load_app_config(cfg)
+    data["llm_jobs"] = n
+    save_app_config(cfg, data)
+    return n
+
+
 def last_mai_json(cfg: Config) -> str | None:
     p = load_app_config(cfg).get("last_mai_json")
     return p if isinstance(p, str) and p else None

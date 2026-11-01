@@ -1,8 +1,10 @@
-"""Batch transcription: planning, resume, error policy, CLI.
+"""Batch transcription: planning, resume, error policy, pipeline, CLI.
 
-The playground (browser, network) is faked at the two seams run_batch uses --
-``runner.browser_session`` and ``runner.run_full`` / ``resegment_existing`` --
-so every decision the batch makes runs for real.
+The playground (browser, network) and ffmpeg are faked at the seams the batch
+pipeline uses -- ``runner.browser_session``, ``runner.prepare_media``,
+``runner.transcribe_prepared``, ``runner.segment_transcribed`` and
+``runner.resegment_existing`` -- so every decision the batch makes runs for
+real.
 """
 from __future__ import annotations
 
@@ -57,17 +59,32 @@ def res(**kw):
 
 
 class Fake:
-    """Stand-ins for the playground seams, recording what was asked of them."""
+    """Stand-ins for the playground seams, recording what was asked of them.
+
+    ``full`` lists the uploads (audio, page) -- what used to be one run_full
+    per file; ``fail`` makes a file's upload fail, ``fail_prepare`` its
+    preparation, ``fail_segment`` its segmentation.
+    """
 
     def __init__(self, monkeypatch, *, session_error=None):
         self.sessions = 0
+        self.prepared: list[Path] = []
         self.full: list[tuple[Path, object]] = []
+        self.segmented: list[Path] = []
         self.reseg: list[Path] = []
         self.fail: dict[str, Exception] = {}
+        self.fail_prepare: dict[str, Exception] = {}
+        self.fail_segment: dict[str, Exception] = {}
         self.delay = 0.0
+        self.prepare_delay = 0.0
+        self.segment_delay = 0.0
         self.live = 0
         self.peak = 0
+        self.seg_live = 0
+        self.seg_peak = 0
         self.dead = False
+        #: (event, file name) in the order they happened, across stages
+        self.timeline: list[tuple[str, str]] = []
         fake = self
 
         @contextlib.asynccontextmanager
@@ -77,8 +94,21 @@ class Fake:
                 raise session_error
             yield "PAGE"
 
-        async def run_full(cfg, audio, **kw):
+        async def prepare_media(cfg, audio, on_stage=None, on_log=None):
+            fake.prepared.append(audio)
+            fake.timeline.append(("prepare", audio.name))
+            if fake.prepare_delay:
+                await asyncio.sleep(fake.prepare_delay)
+            if audio.name in fake.fail_prepare:
+                raise fake.fail_prepare[audio.name]
+            return runner.PreparedMedia(audio=audio, info=None,
+                                        workdir=audio.parent / ".no-workdir",
+                                        pieces=[])
+
+        async def transcribe_prepared(cfg, prepared, json_path, **kw):
+            audio = prepared.audio
             fake.full.append((audio, kw["page"]))
+            fake.timeline.append(("upload", audio.name))
             fake.live += 1
             fake.peak = max(fake.peak, fake.live)
             try:
@@ -86,15 +116,33 @@ class Fake:
                     await asyncio.sleep(fake.delay)
                 if audio.name in fake.fail:
                     raise fake.fail[audio.name]
-                # what the real run_full leaves behind: transcript + subtitles
-                kw["json_path"].parent.mkdir(parents=True, exist_ok=True)
-                kw["json_path"].write_text(
+                # what the real one leaves behind: the transcript
+                json_path.parent.mkdir(parents=True, exist_ok=True)
+                json_path.write_text(
                     json.dumps({"source": str(audio), "words": []}),
                     encoding="utf-8")
-                kw["srt_path"].write_text("srt", encoding="utf-8")
-                return res(json_path=kw["json_path"])
+                return runner.Transcribed(audio=audio, doc={}, stitched=None,
+                                          json_path=json_path)
             finally:
                 fake.live -= 1
+                fake.timeline.append(("uploaded", audio.name))
+
+        async def segment_transcribed(cfg, transcribed, srt_path, **kw):
+            audio = transcribed.audio
+            fake.segmented.append(audio)
+            fake.timeline.append(("segment", audio.name))
+            fake.seg_live += 1
+            fake.seg_peak = max(fake.seg_peak, fake.seg_live)
+            try:
+                if fake.segment_delay:
+                    await asyncio.sleep(fake.segment_delay)
+                if audio.name in fake.fail_segment:
+                    raise fake.fail_segment[audio.name]
+                srt_path.write_text("srt", encoding="utf-8")
+                return res(json_path=transcribed.json_path)
+            finally:
+                fake.seg_live -= 1
+                fake.timeline.append(("segmented", audio.name))
 
         async def reseg(cfg, json_path, srt_path, **kw):
             fake.reseg.append(json_path)
@@ -102,7 +150,9 @@ class Fake:
             return res(entries=7, json_path=json_path)
 
         monkeypatch.setattr(runner, "browser_session", session)
-        monkeypatch.setattr(runner, "run_full", run_full)
+        monkeypatch.setattr(runner, "prepare_media", prepare_media)
+        monkeypatch.setattr(runner, "transcribe_prepared", transcribe_prepared)
+        monkeypatch.setattr(runner, "segment_transcribed", segment_transcribed)
         monkeypatch.setattr(runner, "resegment_existing", reseg)
         import mai2srt.transcribe.browser as br
 
@@ -341,16 +391,248 @@ def test_cancel_leaves_an_accurate_partial_report(cfg, tmp_path, monkeypatch):
 def test_llm_fallback_is_counted(cfg, tmp_path, monkeypatch):
     Fake(monkeypatch)
 
-    async def run_full(cfg, audio, **kw):
-        kw["srt_path"].write_text("x", encoding="utf-8")
+    async def segment_transcribed(cfg, transcribed, srt_path, **kw):
+        srt_path.write_text("x", encoding="utf-8")
         return res(llm_note="quota exceeded")
 
-    monkeypatch.setattr(runner, "run_full", run_full)
+    monkeypatch.setattr(runner, "segment_transcribed", segment_transcribed)
     a = touch(tmp_path / "in" / "a.mp3")
     rep = run(cfg, b.plan_batch(cfg, [a]))
     assert rep.to_dict()["llm_fallback"] == 1
     assert rep.ok                                  # a fallback is not a failure
     assert "LLM fallback 1" in b.format_summary(rep)
+
+
+# ----------------------------------------------------------------- pipeline
+
+def test_the_next_file_uploads_while_the_previous_one_is_segmented(cfg, tmp_path, monkeypatch):
+    """The point of the pipeline: segmentation (LLM) of file 1 overlaps the
+    upload of file 2, and file 2 is prepared during file 1's upload."""
+    fake = Fake(monkeypatch)
+    fake.delay = 0.05
+    fake.segment_delay = 0.2
+    files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "ab"]
+    rep = run(cfg, b.plan_batch(cfg, files))
+    assert rep.ok and rep.count(b.ST_DONE) == 2
+    t = fake.timeline
+    # b's upload starts before a's segmentation has finished
+    assert t.index(("upload", "b.mp3")) < t.index(("segmented", "a.mp3"))
+    # b is prepared before a's upload has finished
+    assert t.index(("prepare", "b.mp3")) < t.index(("uploaded", "a.mp3"))
+
+
+def test_preparation_runs_at_most_one_file_ahead(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.delay = 0.1
+    files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abcd"]
+    report = b.BatchReport(b.plan_batch(cfg, files))
+
+    async def go():
+        t = asyncio.ensure_future(b.run_batch(cfg, report))
+        await asyncio.sleep(0.05)               # a uploading
+        snapshot = [p.name for p in fake.prepared]
+        await t
+        return snapshot
+
+    assert asyncio.run(go()) == ["a.mp3", "b.mp3"]
+    assert report.count(b.ST_DONE) == 4
+
+
+def test_segmentation_concurrency_follows_llm_jobs(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.segment_delay = 0.1
+    files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abcd"]
+    run(cfg, b.plan_batch(cfg, files))
+    assert fake.seg_peak == 1                    # default: one at a time
+    fake2 = Fake(monkeypatch)
+    fake2.segment_delay = 0.1
+    run(cfg, b.plan_batch(cfg, files, overwrite=True), llm_jobs=2)
+    assert fake2.seg_peak == 2
+    fake3 = Fake(monkeypatch)
+    fake3.segment_delay = 0.02
+    run(cfg, b.plan_batch(cfg, files, overwrite=True), llm_jobs=99)
+    assert fake3.seg_peak <= b.MAX_LLM_JOBS
+
+
+def test_bad_media_fails_in_preparation_and_the_rest_goes_on(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.fail_prepare["b.mp3"] = MediaError("no audio stream in b.mp3")
+    files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abc"]
+    rep = run(cfg, b.plan_batch(cfg, files))
+    assert [i.status for i in rep.items] == [b.ST_DONE, b.ST_FAILED, b.ST_DONE]
+    assert [p.name for p, _ in fake.full] == ["a.mp3", "c.mp3"]
+    assert rep.aborted is None
+
+
+def test_a_segmentation_failure_keeps_the_transcript(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.fail_segment["a.mp3"] = RuntimeError("LLM endpoint down")
+    a = touch(tmp_path / "in" / "a.mp3")
+    rep = run(cfg, b.plan_batch(cfg, [a]))
+    assert rep.items[0].status == b.ST_FAILED
+    assert rep.items[0].json_path.exists()        # the upload is not lost
+    # and the next run only re-segments it
+    assert b.plan_batch(cfg, [a])[0].action == b.ACT_RESEGMENT
+
+
+def test_an_abort_still_segments_files_already_uploaded(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.segment_delay = 0.2
+    fake.fail["b.mp3"] = BiometricConsentRequired("451: accept the notice")
+    files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abc"]
+    rep = run(cfg, b.plan_batch(cfg, files))
+    assert rep.aborted and "451" in rep.aborted
+    st = {i.audio.name: i.status for i in rep.items}
+    assert st == {"a.mp3": b.ST_DONE, "b.mp3": b.ST_FAILED, "c.mp3": b.ST_CANCELLED}
+    assert [p.name for p in fake.segmented] == ["a.mp3"]
+
+
+def test_a_queue_that_only_resegments_never_opens_a_browser_even_with_appends(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    half = touch(tmp_path / "in" / "half.mp3")
+    make_project(cfg, half)
+    rep = run(cfg, b.plan_batch(cfg, [half]))
+    assert rep.ok and fake.sessions == 0
+
+
+def queue_run(cfg, items, during, **kw):
+    """Run a BatchQueue and call ``during(queue)`` while it is running."""
+    report = b.BatchReport(items)
+
+    async def go():
+        q = b.BatchQueue(cfg, report, **kw)
+        t = asyncio.ensure_future(q.run())
+        await asyncio.sleep(0.02)
+        out = during(q)
+        if asyncio.iscoroutine(out):
+            out = await out
+        await t
+        return q, out
+
+    q, out = asyncio.run(go())
+    return report, q, out
+
+
+def test_files_can_be_appended_while_the_queue_runs(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.delay = 0.05
+    a = touch(tmp_path / "in" / "a.mp3")
+    c = touch(tmp_path / "in" / "c.mp3")
+    rep, q, added = queue_run(cfg, b.plan_batch(cfg, [a]),
+                              lambda q: q.add([c, a]))
+    assert [i.audio.name for i in added] == ["c.mp3"]   # a is already running
+    assert [i.index for i in rep.items] == [0, 1]
+    assert [p.name for p, _ in fake.full] == ["a.mp3", "c.mp3"]
+    assert rep.count(b.ST_DONE) == 2 and fake.sessions == 1
+    assert q.closed and q.add([touch(tmp_path / "in" / "late.mp3")]) is None
+
+
+def test_an_appended_finished_file_is_skipped_unless_overwritten(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.delay = 0.05
+    a = touch(tmp_path / "in" / "a.mp3")
+    done = touch(tmp_path / "in" / "done.mp3")
+    make_project(cfg, done)
+    touch(done.with_suffix(".srt"))
+
+    def during(q):
+        first = q.add([done])
+        # the same object is re-queued below: look at it now
+        snap = (first[0].action, first[0].status)
+        again = q.add([done])                 # a settled duplicate: nothing
+        forced = q.add([done], overwrite=True)
+        return first, snap, again, forced
+
+    rep, _, (first, snap, again, forced) = queue_run(cfg, b.plan_batch(cfg, [a]), during)
+    assert snap == (b.ACT_SKIP, b.ST_SKIPPED)
+    assert again == []
+    assert forced[0] is first[0] and forced[0].index == 1   # re-queued in place
+    assert len(rep.items) == 2
+    assert [p.name for p, _ in fake.full] == ["a.mp3", "done.mp3"]
+    assert rep.items[1].status == b.ST_DONE
+
+
+def test_a_failed_file_is_retried_when_added_again(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.delay = 0.03
+    fake.fail_prepare["bad.mp3"] = MediaError("corrupt")
+    bad = touch(tmp_path / "in" / "bad.mp3")
+    slow = touch(tmp_path / "in" / "slow.mp3")
+
+    async def during(q):
+        await asyncio.sleep(0.01)               # bad has failed by now
+        assert q.report.items[0].status == b.ST_FAILED
+        fake.fail_prepare.clear()
+        return q.add([bad])
+
+    rep, _, again = queue_run(cfg, b.plan_batch(cfg, [bad, slow]), during)
+    assert again[0].index == 0
+    assert rep.items[0].status == b.ST_DONE
+
+
+def test_a_waiting_file_can_be_removed_but_a_running_one_cannot(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.delay = 0.05
+    files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abc"]
+
+    def during(q):
+        return q.remove(0), q.remove(2), q.remove(2)
+
+    rep, _, (running, removed, twice) = queue_run(cfg, b.plan_batch(cfg, files), during)
+    assert running is None and twice is None
+    assert removed.audio.name == "c.mp3" and removed.status == b.ST_REMOVED
+    assert [i.audio.name for i in rep.items] == ["a.mp3", "b.mp3"]
+    assert [p.name for p, _ in fake.full] == ["a.mp3", "b.mp3"]
+
+
+def test_removing_every_waiting_file_lets_the_queue_finish(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.delay = 0.05
+    files = [touch(tmp_path / "in" / f"{n}.mp3") for n in "abcd"]
+
+    def during(q):
+        # a uploads, b is prepared ahead; c and d wait for a slot
+        return [q.remove(i) for i in (2, 3)]
+
+    rep, q, removed = queue_run(cfg, b.plan_batch(cfg, files), during)
+    assert all(r is not None for r in removed)
+    assert [i.audio.name for i in rep.items] == ["a.mp3", "b.mp3"]
+    assert rep.count(b.ST_DONE) == 2 and rep.ok
+    assert q.closed and q.remove(0) is None
+
+
+def test_appended_same_stem_files_do_not_share_outputs(cfg, tmp_path, monkeypatch):
+    fake = Fake(monkeypatch)
+    fake.delay = 0.05
+    a = touch(tmp_path / "x" / "clip.mp3")
+    w = touch(tmp_path / "x" / "clip.wav")        # same folder, same stem
+    rep, _, _ = queue_run(cfg, b.plan_batch(cfg, [a]), lambda q: q.add([w]))
+    assert rep.items[0].srt != rep.items[1].srt
+    assert rep.items[0].json_path != rep.items[1].json_path
+
+
+def test_an_aborted_queue_refuses_appends(cfg, tmp_path, monkeypatch):
+    Fake(monkeypatch, session_error=runner.AuthRequired("not signed in"))
+    a = touch(tmp_path / "in" / "a.mp3")
+    report = b.BatchReport(b.plan_batch(cfg, [a]))
+
+    async def go():
+        q = b.BatchQueue(cfg, report)
+        await q.run()
+        return q.add([touch(tmp_path / "in" / "b.mp3")])
+
+    assert asyncio.run(go()) is None
+    assert report.aborted
+
+
+def test_phases_follow_the_pipeline(cfg, tmp_path, monkeypatch):
+    Fake(monkeypatch)
+    seen: list[tuple[str, str]] = []
+    a = touch(tmp_path / "in" / "a.mp3")
+    run(cfg, b.plan_batch(cfg, [a]),
+        on_item_phase=lambda it: seen.append((it.audio.name, it.phase)))
+    assert [p for _, p in seen] == [b.PH_PREPARE, b.PH_WAIT_UPLOAD, b.PH_UPLOAD,
+                                    b.PH_WAIT_SEGMENT, b.PH_SEGMENT]
 
 
 # ---------------------------------------------------------------------- CLI

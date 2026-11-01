@@ -94,14 +94,14 @@ def test_log_lines_carry_the_file_position(client, tmp_path, monkeypatch):
     c, _ = client
     Fake(monkeypatch)
 
-    async def run_full(cfg, audio, **kw):
+    async def segment_transcribed(cfg, transcribed, srt_path, **kw):
         kw["on_log"]("hello")
-        kw["srt_path"].write_text("x", encoding="utf-8")
+        srt_path.write_text("x", encoding="utf-8")
         return type("R", (), dict(words=1, entries=1, dialogue=0, llm_note=None,
-                                  json_path=kw["json_path"], entry_list=None,
-                                  word_refs=None))()
+                                  json_path=transcribed.json_path,
+                                  entry_list=None, word_refs=None))()
 
-    monkeypatch.setattr(runner, "run_full", run_full)
+    monkeypatch.setattr(runner, "segment_transcribed", segment_transcribed)
     job_id = start(c, [touch(tmp_path / "in" / "a.mp3")])
     settle(c, job_id)
     lines = [d["line"] for t, d in events(c, job_id) if t == "log"]
