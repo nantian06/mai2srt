@@ -404,3 +404,38 @@ def test_cli_end_to_end_with_report_and_exit_code(home, tmp_path, monkeypatch, c
     fake.fail.clear()
     assert cli.main(["batch", str(tmp_path / "in")]) == 0
     assert [p.name for p, _ in fake.full] == ["bad.mp3", "ok.mp3", "bad.mp3"]
+
+
+# --------------------------------------------- review follow-ups (Codex, PR 1)
+
+def test_an_srt_older_than_its_transcript_is_stale_not_done(cfg, tmp_path):
+    """run_full writes the transcript first and the SRT last: an SRT that is
+    older than the transcript is what a failed/cancelled re-transcription
+    leaves behind, and must be rebuilt instead of skipped for good."""
+    import os
+    a = touch(tmp_path / "in" / "a.mp3")
+    project = make_project(cfg, a)
+    srt = touch(a.with_suffix(".srt"))
+    now = project.stat().st_mtime
+    os.utime(srt, (now + 5, now + 5))
+    assert b.plan_batch(cfg, [a])[0].action == b.ACT_SKIP
+    os.utime(srt, (now - 5, now - 5))
+    [it] = b.plan_batch(cfg, [a])
+    assert it.action == b.ACT_RESEGMENT
+    assert "newer" in it.reason
+
+
+def test_cli_exits_nonzero_when_an_input_could_not_be_collected(home, tmp_path, monkeypatch, capsys):
+    import mai2srt.preflight as pf
+    monkeypatch.setattr(pf, "missing_requirements", lambda cfg, **k: [])
+    fake = Fake(monkeypatch)
+    good = touch(tmp_path / "in" / "good.mp3")
+    report = tmp_path / "r.json"
+    rc = cli.main(["batch", "--report", str(report), str(good),
+                   str(tmp_path / "typo.mp3")])
+    assert rc == 1                                     # incomplete, even though good.mp3 worked
+    assert [p.name for p, _ in fake.full] == ["good.mp3"]   # ...and it still ran
+    data = json.loads(report.read_text("utf-8"))
+    assert data["ok"] is False and data["done"] == 1
+    assert any("typo.mp3" in m for m in data["input_problems"])
+    assert "INPUT NOT PROCESSED" in capsys.readouterr().out

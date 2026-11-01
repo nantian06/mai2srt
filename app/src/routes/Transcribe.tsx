@@ -126,7 +126,8 @@ export function TranscribePage() {
       setBatchPaths(media);
     } else {
       const p = media[0] ?? ok[0];
-      setIsJson(p.endsWith('.mai.json'));
+      // classify(), not a suffix test: the picker also accepts plain .json
+      setIsJson(classify(p) === 'json');
       setPath(p);
       setBatchPaths([]);
     }
@@ -239,7 +240,14 @@ export function TranscribePage() {
           setError(m);
           toast('error', m.slice(0, 160));
         },
-        onCancelled: () => setError(t('t.toast.cancelled')),
+        onCancelled: () => {
+          setError(t('t.toast.cancelled'));
+          // the server's terminal event closes the stream before the batch
+          // can report the files it stopped, so settle those rows here
+          setFiles((fs) => fs.map((f) => (
+            f.status === 'running' || f.status === 'pending'
+              ? { ...f, status: 'cancelled' as const } : f)));
+        },
       });
     } catch (e) {
       setError(String(e));
@@ -294,7 +302,7 @@ export function TranscribePage() {
             toast('warn', t('t.drop.rejected'));
             return;
           }
-          setIsJson(f.name.endsWith('.mai.json'));
+          setIsJson(classify(f.name) === 'json');
           setPath(f.name);
         }}
         className="relative"
