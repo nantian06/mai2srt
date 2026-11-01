@@ -8,6 +8,9 @@ extracted ONCE into an app-data cache; every later open is instant:
     IO-bound: seconds for an hour of audio)
   - anything else (ac3/dts/pcm...)  -> mp3 192k transcode (~50-100x
     realtime)
+  - on Linux AAC is "anything else" too: the WebKitGTK webview cannot
+    decode it on a stock system (see webview_decodes_aac), so AAC tracks
+    and .m4a/.aac files are transcoded there
 Cache names hash (resolved path + mtime + size), so a changed source
 naturally invalidates its entry; index.json maps hashes back to source
 paths for the settings-card cache manager. The cache is pure derived
@@ -19,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -27,33 +31,74 @@ from .probe import MediaError, probe, resolve_tool, run_tool
 
 log = logging.getLogger("mai2srt.media")
 
-#: extensions the audio endpoint serves DIRECTLY (mime map + Chromium
-#: decoder coverage). Owned here so the whole playback chain -- endpoint
-#: allowlist, extraction decision, binding validation -- shares one truth.
-DIRECT_PLAY_MIMES = {
+#: every audio extension the endpoint has a MIME type for, and the audio
+#: files a user may bind for playback. Whether the webview can DECODE one is
+#: a separate, per-platform question: see direct_play_mimes().
+AUDIO_MIMES = {
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
     ".aac": "audio/aac", ".ogg": "audio/ogg", ".oga": "audio/ogg",
     ".flac": "audio/flac", ".opus": "audio/ogg",
 }
+
+#: the AAC carriers among AUDIO_MIMES
+_AAC_EXTS = {".m4a", ".aac"}
 
 #: video containers the transcribe page accepts (drop + file dialog)
 VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".wmv",
               ".ts", ".flv"}
 
 #: audio codecs the element decodes natively -> remux instead of
-#: transcode (target extension must be in DIRECT_PLAY_MIMES and a
-#: container ffmpeg can write via stream copy)
+#: transcode (target extension must be directly playable and a container
+#: ffmpeg can write via stream copy)
 _COPY_TARGET = {"aac": ".m4a", "mp3": ".mp3", "flac": ".flac",
                 "opus": ".opus", "vorbis": ".ogg"}
+
+
+def webview_decodes_aac() -> bool:
+    """Can the desktop app's webview decode AAC with what a stock system has?
+
+    Windows (WebView2, Chromium) and macOS (WKWebView) can. Linux renders the
+    UI with WebKitGTK, which hands media to GStreamer, and a stock install
+    (gst-plugins-base + good -- also all the AppImage bundles) has NO AAC
+    decoder: that needs gst-libav or plugins-bad. The pipeline then stops at
+    "Missing decoder: MPEG-4 AAC" and the play button stays silent. Most
+    videos carry AAC, so their remuxed .m4a cache was unplayable there; mp3,
+    Opus, Vorbis, FLAC and WAV all decode with base + good.
+    """
+    return sys.platform in ("win32", "darwin")
+
+
+def direct_play_mimes() -> dict[str, str]:
+    """Extensions /api/audio serves AS-IS on this platform (with their MIME).
+
+    Owned here so the whole playback chain -- endpoint, extraction decision,
+    cache lookup -- shares one truth. Everything else goes through the
+    extraction cache first.
+    """
+    if webview_decodes_aac():
+        return dict(AUDIO_MIMES)
+    return {k: v for k, v in AUDIO_MIMES.items() if k not in _AAC_EXTS}
+
+
+def _copy_targets() -> dict[str, str]:
+    """Codec -> remux target, limited to what this platform can decode."""
+    if webview_decodes_aac():
+        return dict(_COPY_TARGET)
+    return {k: v for k, v in _COPY_TARGET.items() if v not in _AAC_EXTS}
 
 
 def is_video(p) -> bool:
     return Path(p).suffix.lower() in VIDEO_EXTS
 
 
+def is_bindable(p) -> bool:
+    """May this file be bound as a transcript's playback audio?"""
+    return Path(p).suffix.lower() in AUDIO_MIMES or is_video(p)
+
+
 def needs_extraction(p) -> bool:
     """True when /api/audio cannot serve this file as-is."""
-    return Path(p).suffix.lower() not in DIRECT_PLAY_MIMES
+    return Path(p).suffix.lower() not in direct_play_mimes()
 
 
 def audio_cache_dir(cfg: Config) -> Path:
@@ -75,8 +120,11 @@ def existing_cache(cfg: Config, src: Path) -> Path | None:
         hits = sorted(audio_cache_dir(cfg).glob(cache_key(src) + ".*"))
     except OSError:
         return None
+    playable = direct_play_mimes()
     for h in hits:
-        if ".part" not in h.name:
+        # an entry this platform cannot decode (an AAC remux made before
+        # Linux stopped producing them) is not a hit: it gets re-extracted
+        if ".part" not in h.name and h.suffix.lower() in playable:
             return h
     return None
 
@@ -147,7 +195,7 @@ def ensure_playable(cfg: Config, src) -> Path:
     key = cache_key(src)
 
     # 1) lossless remux when the codec is natively playable
-    ext = _COPY_TARGET.get(info.codec)
+    ext = _copy_targets().get(info.codec)
     if ext:
         dst = d / (key + ext)
         if dst.exists():
@@ -160,6 +208,7 @@ def ensure_playable(cfg: Config, src) -> Path:
             log.info("audio cache (remux %s): %s -> %s",
                      info.codec, src.name, dst.name)
             _index_note(cfg, key, src)
+            _drop_unplayable(d, key, dst)
             return dst
         except MediaError:
             tmp.unlink(missing_ok=True)
@@ -175,7 +224,25 @@ def ensure_playable(cfg: Config, src) -> Path:
         os.replace(tmp, dst)
         log.info("audio cache (mp3): %s -> %s", src.name, dst.name)
     _index_note(cfg, key, src)
+    _drop_unplayable(d, key, dst)
     return dst
+
+
+def _drop_unplayable(d: Path, key: str, keep: Path) -> None:
+    """Remove this key's cache entries the platform cannot decode.
+
+    They are dead weight once a playable one exists (existing_cache skips
+    them): an old AAC remux on Linux would otherwise sit in the cache manager
+    forever. Best effort -- a file in use stays until the next extraction.
+    """
+    playable = direct_play_mimes()
+    for h in d.glob(key + ".*"):
+        if (h != keep and ".part" not in h.name
+                and h.suffix.lower() not in playable):
+            try:
+                h.unlink()
+            except OSError:
+                pass
 
 
 # ----------------------------------------------------------------- resolve

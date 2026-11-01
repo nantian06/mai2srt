@@ -106,6 +106,112 @@ async def browser_session(cfg: Config, on_log: LogCb = _default_log):
                 pass
 
 
+@dataclass
+class PreparedMedia:
+    """A source probed and cut into upload pieces (first pipeline stage).
+
+    ``workdir`` holds the encoded pieces; whoever consumes this object owns
+    it and must call :meth:`cleanup` once the pieces are uploaded or dropped.
+    """
+    audio: Path
+    info: object                         # media.probe.MediaInfo
+    workdir: Path
+    pieces: list                         # [(piece path, offset seconds)]
+
+    def cleanup(self) -> None:
+        import shutil
+        shutil.rmtree(self.workdir, ignore_errors=True)
+
+
+@dataclass
+class Transcribed:
+    """An uploaded, stitched transcript already written to ``json_path``
+    (second pipeline stage); segmentation is all that is left."""
+    audio: Path
+    doc: dict
+    stitched: object                     # transcribe.stitch.StitchedTranscript
+    json_path: Path
+
+
+async def prepare_media(
+    cfg: Config,
+    audio: Path,
+    on_stage: StageCb = _noop_stage,
+    on_log: LogCb = _default_log,
+) -> PreparedMedia:
+    """Probe + compress/chunk ``audio`` into a private work directory.
+
+    Local CPU/disk work only (ffprobe, ffmpeg): a batch runs it for the next
+    file while the current one is still uploading.
+    """
+    if not audio.exists():
+        raise TranscribeError(f"audio not found: {audio}")
+    on_stage("prepare", audio.name)
+    # ffprobe/ffmpeg are blocking subprocesses: offloading keeps the server
+    # event loop alive so SSE progress reaches the UI DURING preparation
+    info = await asyncio.to_thread(probe, audio)
+    on_log("source: %s  %.1fs  %dch  %s  %.1f MiB" % (
+        audio.name, info.duration_s, info.channels, info.codec,
+        info.size_bytes / 1024 / 1024))
+
+    import tempfile
+    workdir = Path(tempfile.mkdtemp(prefix="mai2srt_", dir=str(cfg.data_dir)))
+    prepared = PreparedMedia(audio=audio, info=info, workdir=workdir, pieces=[])
+    try:
+        # prepare()'s ffmpeg calls block for minutes on long video; both
+        # callbacks are thread-safe (server jobs emit marshals onto the
+        # loop, CLI logging is thread-safe), so progress can flow from the
+        # to_thread worker directly -- without it the UI sat on a static
+        # "prepare" stage and looked wedged (2026-10-13)
+        def _prep_progress(msg: str) -> None:
+            on_log(msg)
+            on_stage("prepare", msg)
+        prepared.pieces = await asyncio.to_thread(prepare, audio, info, workdir,
+                                                  _prep_progress)
+        on_log("upload plan: %d file(s)" % len(prepared.pieces))
+    except MediaError as e:
+        on_log("media preparation failed: %s" % e)
+        prepared.cleanup()
+        raise
+    except BaseException:
+        prepared.cleanup()
+        raise
+    return prepared
+
+
+async def upload_prepared(
+    cfg: Config,
+    prepared: PreparedMedia,
+    diarize: bool = True,
+    keep: bool = False,
+    include_raw: bool = False,
+    on_stage: StageCb = _noop_stage,
+    on_log: LogCb = _default_log,
+    on_consent: ConsentCb | None = None,
+    page=None,
+) -> tuple[dict, object]:
+    """Upload every prepared piece and stitch them -> (doc, stitched).
+
+    ``page``: an already-authenticated playground page (see browser_session)
+    to upload through; None opens, and afterwards closes, a private one.
+    Does not clean the work directory up: the caller owns ``prepared``.
+    """
+    parts: list = []
+    raws: list = []
+    audio = prepared.audio
+    if page is not None:
+        await _upload_pieces(page, cfg, audio, prepared.pieces, diarize, keep,
+                             parts, raws, on_stage, on_log, on_consent)
+    else:
+        async with browser_session(cfg, on_log) as own_page:
+            await _upload_pieces(own_page, cfg, audio, prepared.pieces,
+                                 diarize, keep, parts, raws, on_stage, on_log,
+                                 on_consent)
+    stitched = stitch(parts, prepared.info.duration_s)
+    doc = build_document(audio, stitched, raws, include_raw)
+    return doc, stitched
+
+
 async def transcribe_audio(
     cfg: Config,
     audio: Path,
@@ -122,52 +228,46 @@ async def transcribe_audio(
     ``page``: an already-authenticated playground page (see browser_session)
     to upload through; None opens, and afterwards closes, a private one.
     """
-    if not audio.exists():
-        raise TranscribeError(f"audio not found: {audio}")
-    on_stage("prepare", audio.name)
-    # ffprobe/ffmpeg are blocking subprocesses: offloading keeps the server
-    # event loop alive so SSE progress reaches the UI DURING preparation
-    info = await asyncio.to_thread(probe, audio)
-    on_log("source: %s  %.1fs  %dch  %s  %.1f MiB" % (
-        audio.name, info.duration_s, info.channels, info.codec,
-        info.size_bytes / 1024 / 1024))
-
-    import tempfile
-    workdir = Path(tempfile.mkdtemp(prefix="mai2srt_", dir=str(cfg.data_dir)))
+    prepared = await prepare_media(cfg, audio, on_stage, on_log)
     try:
-        # prepare()'s ffmpeg calls block for minutes on long video; both
-        # callbacks are thread-safe (server jobs emit marshals onto the
-        # loop, CLI logging is thread-safe), so progress can flow from the
-        # to_thread worker directly -- without it the UI sat on a static
-        # "prepare" stage and looked wedged (2026-10-13)
-        def _prep_progress(msg: str) -> None:
-            on_log(msg)
-            on_stage("prepare", msg)
-        pieces = await asyncio.to_thread(prepare, audio, info, workdir,
-                                         _prep_progress)
-        on_log("upload plan: %d file(s)" % len(pieces))
-    except MediaError as e:
-        on_log("media preparation failed: %s" % e)
-        raise
-
-    parts = []
-    raws = []
-    try:
-        if page is not None:
-            await _upload_pieces(page, cfg, audio, pieces, diarize, keep,
-                                 parts, raws, on_stage, on_log, on_consent)
-        else:
-            async with browser_session(cfg, on_log) as own_page:
-                await _upload_pieces(own_page, cfg, audio, pieces, diarize,
-                                     keep, parts, raws, on_stage, on_log,
-                                     on_consent)
+        return await upload_prepared(
+            cfg, prepared, diarize=diarize, keep=keep, include_raw=include_raw,
+            on_stage=on_stage, on_log=on_log, on_consent=on_consent, page=page)
     finally:
-        import shutil
-        await asyncio.to_thread(shutil.rmtree, workdir, ignore_errors=True)
+        await asyncio.to_thread(prepared.cleanup)
 
-    stitched = stitch(parts, info.duration_s)
-    doc = build_document(audio, stitched, raws, include_raw)
-    return doc, stitched
+
+async def transcribe_prepared(
+    cfg: Config,
+    prepared: PreparedMedia,
+    json_path: Path,
+    diarize: bool = True,
+    keep: bool = False,
+    include_raw: bool = False,
+    on_stage: StageCb = _noop_stage,
+    on_log: LogCb = _default_log,
+    on_consent: ConsentCb | None = None,
+    page=None,
+) -> Transcribed:
+    """Upload a prepared source and write its transcript (.mai.json).
+
+    The transcript is on disk before segmentation starts, so an LLM failure
+    or a cancel later on never costs the (slow, quota-consuming) upload: the
+    next run only re-segments.
+    """
+    doc, stitched = await upload_prepared(
+        cfg, prepared, diarize=diarize, keep=keep, include_raw=include_raw,
+        on_stage=on_stage, on_log=on_log, on_consent=on_consent, page=page)
+    write_transcript(doc, json_path)
+    on_log("wrote %s (%d words)" % (json_path, len(stitched.transcript.words)))
+    return Transcribed(audio=prepared.audio, doc=doc, stitched=stitched,
+                       json_path=json_path)
+
+
+def write_transcript(doc: dict, json_path: Path) -> None:
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(
+        json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 async def _upload_pieces(page, cfg, audio, pieces, diarize, keep, parts, raws,
@@ -352,36 +452,36 @@ async def run_full(
     to the audio unless ``srt_path`` says otherwise (batch --out-dir) --
     subtitles follow the media, transcripts follow the storage policy.
     ``page``: a shared authenticated page (batch); None = private browser."""
-    doc, stitched = await transcribe_audio(
-        cfg, audio, diarize=diarize, keep=keep, include_raw=include_raw,
-        on_stage=on_stage, on_log=on_log, on_consent=on_consent, page=page)
-    json_path = json_path or audio.with_suffix(".mai.json")
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(
-        json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
-    on_log("wrote %s (%d words)" % (json_path, len(stitched.transcript.words)))
+    prepared = await prepare_media(cfg, audio, on_stage, on_log)
+    try:
+        transcribed = await transcribe_prepared(
+            cfg, prepared, json_path or audio.with_suffix(".mai.json"),
+            diarize=diarize, keep=keep, include_raw=include_raw,
+            on_stage=on_stage, on_log=on_log, on_consent=on_consent, page=page)
+    finally:
+        await asyncio.to_thread(prepared.cleanup)
+    return await segment_transcribed(
+        cfg, transcribed, srt_path or audio.parent / (audio.stem + ".srt"),
+        segment_params=segment_params, post_params=post_params,
+        use_llm=use_llm, on_stage=on_stage, on_log=on_log)
 
-    # segmentation + LLM split-point calls are blocking (sync HTTP): offload.
-    # build_entries (not finish_srt) so the entry structure survives for the
-    # refine hand-off edit record
-    entries, llm_note = await asyncio.to_thread(
-        build_entries, cfg, stitched.transcript, stitched.audio_duration_s,
-        segment_params, post_params, use_llm, on_stage, on_log)
-    n_dial = sum(1 for e in entries if e.is_dialogue)
-    srt = to_srt(entries)
-    srt_path = srt_path or audio.parent / (audio.stem + ".srt")
-    srt_path.parent.mkdir(parents=True, exist_ok=True)
-    srt_path.write_text(srt, encoding="utf-8")
-    on_log("wrote %s" % srt_path)
-    if llm_note:
-        on_log("大模型断句未完全生效：%s" % llm_note)
-    return RunResult(
-        doc=doc, srt=srt, json_path=json_path, srt_path=srt_path,
-        words=len(stitched.transcript.words),
-        entries=len(entries), dialogue=n_dial,
-        entry_list=entries,
-        word_refs=sorted(stitched.transcript.words, key=lambda w: w.start),
-        llm_note=llm_note)
+
+async def segment_transcribed(
+    cfg: Config,
+    transcribed: Transcribed,
+    srt_path: Path,
+    segment_params: SegmentParams | None = None,
+    post_params: PostprocessParams | None = None,
+    use_llm: bool = True,
+    on_stage: StageCb = _noop_stage,
+    on_log: LogCb = _default_log,
+) -> RunResult:
+    """Last pipeline stage: segment a fresh transcript and write the SRT."""
+    st = transcribed.stitched
+    return await _segment_and_write(
+        cfg, transcribed.doc, st.transcript, st.audio_duration_s,
+        transcribed.json_path, srt_path, segment_params, post_params,
+        use_llm, on_stage, on_log)
 
 
 async def resegment_existing(
@@ -406,9 +506,20 @@ async def resegment_existing(
         raise TranscribeError("no words in %s; re-transcribe the source" % json_path)
     doc = json.loads(json_path.read_text(encoding="utf-8"))
     on_log("reusing transcript %s (%d words)" % (json_path.name, len(t.words)))
+    return await _segment_and_write(
+        cfg, doc, t, t.duration_s, json_path, srt_path, segment_params,
+        post_params, use_llm, on_stage, on_log)
+
+
+async def _segment_and_write(cfg, doc, transcript, duration_s, json_path,
+                             srt_path, segment_params, post_params, use_llm,
+                             on_stage, on_log) -> RunResult:
+    # segmentation + LLM split-point calls are blocking (sync HTTP): offload.
+    # build_entries (not finish_srt) so the entry structure survives for the
+    # refine hand-off edit record
     entries, llm_note = await asyncio.to_thread(
-        build_entries, cfg, t, t.duration_s, segment_params, post_params,
-        use_llm, on_stage, on_log)
+        build_entries, cfg, transcript, duration_s, segment_params,
+        post_params, use_llm, on_stage, on_log)
     n_dial = sum(1 for e in entries if e.is_dialogue)
     srt = to_srt(entries)
     srt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -418,8 +529,9 @@ async def resegment_existing(
         on_log("大模型断句未完全生效：%s" % llm_note)
     return RunResult(
         doc=doc, srt=srt, json_path=json_path, srt_path=srt_path,
-        words=len(t.words), entries=len(entries), dialogue=n_dial,
-        entry_list=entries, word_refs=sorted(t.words, key=lambda w: w.start),
+        words=len(transcript.words), entries=len(entries), dialogue=n_dial,
+        entry_list=entries,
+        word_refs=sorted(transcript.words, key=lambda w: w.start),
         llm_note=llm_note)
 
 

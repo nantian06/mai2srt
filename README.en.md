@@ -8,7 +8,7 @@
 
 Drop in audio or video, get a word-level transcript, fix the segmentation the way you like it, export a standard SRT.
 
-Free transcription · no GPU · Windows 10 / 11 (desktop app) · Linux (CLI & batch, from source)
+Free transcription · no GPU · Windows 10 / 11 (desktop app) · Linux (.deb / AppImage, or from source)
 
 <br />
 
@@ -129,7 +129,7 @@ This is where you rewrite the subtitles. The left column holds the segmentation 
 
 FFmpeg is bundled with the installer — you do **not** need to install it yourself.
 
-**Linux** `.deb` and `AppImage` (x86_64) release builds are now configured; future version tags will produce both installers. The current `v0.2.0` release still contains only the Windows installer. The CLI and batch transcription remain available from source; see [Linux](#linux).
+**Linux**: from `v0.3.0` on, every release ships x86_64 `.deb` and `AppImage` installers; the CLI and batch transcription also run from source, see [Linux](#linux).
 
 ---
 
@@ -156,7 +156,9 @@ FFmpeg is bundled with the installer — you do **not** need to install it yours
 5. To make the segmentation finer, click "refine subtitles" to open the Refine page and edit, merge, delete or split as needed. You can listen while you adjust, and clicking a line jumps to that cue
 6. When you are happy, press "save .srt" — it writes `<name>_refined.srt` next to the original audio/video, leaving the earlier `.srt` untouched
 
-**Several files at once:** drop or pick more than one audio/video file and the page turns into a queue — remove files you do not want, press "transcribe N files", and each row shows its own status (waiting / running / done / skipped / failed, with the reason for a failure). Files that already have a transcript and subtitles are skipped, so after a failure "retry failed" simply runs the batch again. A batch uses one browser session and goes through the files one at a time; the command-line equivalent is [`mai2srt batch`](#batch-transcription).
+**Several files at once:** drop or pick more than one audio/video file and the page turns into a queue — remove files you do not want, press "transcribe N files", and each row shows its own status (waiting / preparing / uploading / segmenting / done / skipped / failed, with the reason for a failure). **You can keep dropping files while a transcription runs**: they join the end of the queue, and a file that has not started can still be removed. Files that already have a transcript and subtitles are skipped by default, and their row offers "re-transcribe"; after a failure "retry failed" simply runs the batch again. The command-line equivalent is [`mai2srt batch`](#batch-transcription).
+
+**The queue is a pipeline:** preparing (local ffmpeg compression and chunking), uploading (the playground) and segmenting (the LLM) run at the same time — while one file is segmented the next one uploads and the one after is prepared, so a batch takes about as long as its slowest step. Preparation runs at most one file ahead, so temporary files do not pile up. How many files the LLM segments at once is set under **Settings → LLM** (default 1; keep 1 for strictly rate-limited providers or a local model).
 
 **Task monitor:** the "Tasks" page in the sidebar lists every background task of this session (transcriptions, batches, sign-ins): the live stage and a progress bar, each batch file's status, the full log and the elapsed time. Cancel a running task there, open a result's folder, or send a single file straight to refine. Tasks no longer belong to the Transcribe page: switch to another page and back, or even reload the UI, and a running task is still shown; when it ends you get a notice whichever page is open. The number next to "Tasks" is how many are running.
 
@@ -209,7 +211,9 @@ Installing over an existing version, or uninstalling silently (`/S`), ignores bo
 
 ## Linux
 
-The x86_64 `.deb` and `AppImage` installers will be attached to future version releases. The current `v0.2.0` release does not contain Linux packages. They are built on Ubuntu 22.04 for compatibility with Ubuntu 22.04 and compatible/newer distributions; desktop behavior has not been tested across every distribution.
+From `v0.3.0` on, every release ships x86_64 `.deb` and `AppImage` installers. They are built on Ubuntu 22.04 for compatibility with Ubuntu 22.04 and compatible/newer distributions; desktop behavior has not been tested across every distribution.
+
+On Linux the refine page's audio is decoded by WebKitGTK + GStreamer. A system with only the base GStreamer plugins has no AAC decoder, so video soundtracks and `.m4a` / `.aac` files are converted to mp3 in the audio extraction cache before they play (a few seconds' wait the first time).
 
 The `.deb` package installs FFmpeg as a package dependency. For the AppImage, install FFmpeg yourself and ensure `ffmpeg` and `ffprobe` are on `PATH` (for example, `sudo apt install ffmpeg`). AppImage also requires the distribution's WebKitGTK 4.1 runtime; on Ubuntu, install `libwebkit2gtk-4.1-0`.
 
@@ -305,10 +309,11 @@ mai2srt batch ~/recordings --dry-run              # list what would run, be re-s
 mai2srt batch ~/recordings --report report.json   # also write a machine-readable summary
 ```
 
-- **One browser session for the whole batch**, started once, so a hundred files do not mean a hundred browser launches. Files go one at a time by default; `--jobs 2` or `--jobs 3` upload in parallel (the ceiling is 3 — the playground is a free shared service, raise it with care).
+- **One browser session for the whole batch**, started once, so a hundred files do not mean a hundred browser launches.
+- **Pipelined.** Preparing (ffmpeg), uploading (the playground) and segmenting (the LLM) each have their own workers: while one file uploads, the next is prepared and the previous one segmented. One upload at a time by default; `--jobs 2` or `--jobs 3` upload in parallel (the ceiling is 3 — the playground is a free shared service, raise it with care). `--llm-jobs N` sets how many files are segmented at once (default: the desktop app's setting, 1; max 4).
 - **Safe to re-run.** A file counts as finished when both its transcript (in the project library) and its `.srt` exist, and finished files are skipped. A file with a transcript but no `.srt` is only re-segmented — nothing is uploaded again. `--overwrite` redoes everything.
-- **Failures are contained.** A bad file (corrupt media, one upload that keeps failing) is recorded and the batch carries on; the summary at the end lists what happened and the exit code is non-zero if anything failed. Problems that would sink every file — not signed in, an expired session, the biometric notice (HTTP 451), no usable browser — stop the batch immediately and say how to fix it.
-- **Ctrl-C** stops the current file, prints what was finished, and exits with code 130. Re-run the same command to continue.
+- **Failures are contained.** A bad file (corrupt media, one upload that keeps failing) is recorded and the batch carries on; the summary at the end lists what happened and the exit code is non-zero if anything failed. Problems that would sink every file — not signed in, an expired session, the biometric notice (HTTP 451), no usable browser — stop further uploads immediately and say how to fix it; files already uploaded are still segmented and get their subtitles.
+- **Ctrl-C** stops the files in progress, prints what was finished, and exits with code 130. Re-run the same command to continue.
 - `--out-dir` collects the subtitles in one folder. Files with the same name from different folders get a short hash in the name (`clip-3fa9c1.srt`) rather than overwriting each other. Without `--out-dir`, each `.srt` lands next to its source, as with `run`.
 - Segmentation options (`--no-llm`, `--max-chars`, …) work as for `run`. If an LLM call fails the file falls back to rule-based splitting, and the summary counts it under "LLM fallback".
 
@@ -405,7 +410,7 @@ This tool was written for personal study and low-frequency use. The playground i
 
 mai2srt is released under the [GNU General Public License v3](./LICENSE). Third-party components bundled in the installer keep their own licenses — see [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md).
 
-Development docs: [Design](docs/design.md) · [Maintenance changelog](docs/changelog.md) · [Release notes](docs/release-notes/v0.2.0.md).
+Development docs: [Design](docs/design.md) · [Maintenance changelog](docs/changelog.md) · [Release notes](docs/release-notes/v0.3.0.md).
 
 ---
 

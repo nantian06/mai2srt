@@ -42,6 +42,9 @@ export interface TrackedJob {
   stageDetail: string;
   /** batch: the file the last stage event was about */
   stageFile: number | null;
+  /** batch: each running file's latest stage detail (e.g. "chunk 2/3"),
+   *  by file index -- several files are in flight at once */
+  fileDetail: Record<number, string>;
   files: BatchFile[];
   logs: string[];
   result: DoneData | null;
@@ -102,6 +105,7 @@ function fromSummary(s: JobSummary, live: boolean): TrackedJob {
     stage: '',
     stageDetail: '',
     stageFile: null,
+    fileDetail: {},
     files: [],
     logs: [],
     result: null,
@@ -126,15 +130,29 @@ function open(id: string) {
     });
   const end = () => { es.close(); streams.delete(id); };
 
-  on('stage', (d) => patch(id, () => ({
-    stage: String(d.stage ?? ''),
-    stageDetail: String(d.detail ?? ''),
-    stageFile: typeof d.file_index === 'number' ? d.file_index : null,
-  })));
+  on('stage', (d) => patch(id, (j) => {
+    const fi = typeof d.file_index === 'number' ? d.file_index : null;
+    return {
+      stage: String(d.stage ?? ''),
+      stageDetail: String(d.detail ?? ''),
+      stageFile: fi,
+      fileDetail: fi === null ? j.fileDetail : { ...j.fileDetail, [fi]: String(d.detail ?? '') },
+    };
+  }));
   on('plan', (d) => patch(id, () => ({ files: d.items as BatchFile[] })));
   on('file', (d) => {
+    // upsert: an index not seen yet is a file appended to the running
+    // queue; status `removed` takes the row out again
     const f = d as unknown as BatchFile;
-    patch(id, (j) => ({ files: j.files.map((x) => (x.index === f.index ? f : x)) }));
+    patch(id, (j) => {
+      const known = j.files.some((x) => x.index === f.index);
+      const files = f.status === 'removed'
+        ? j.files.filter((x) => x.index !== f.index)
+        : known
+          ? j.files.map((x) => (x.index === f.index ? f : x))
+          : [...j.files, f].sort((a, b) => a.index - b.index);
+      return { files };
+    });
   });
   on('log', (d) => patch(id, (j) => ({
     logs: j.logs.length >= LOG_CAP
@@ -329,16 +347,22 @@ export function useJob(id: string | null): TrackedJob | undefined {
   return useSyncExternalStore(subscribe, () => (id ? jobs.get(id) : undefined));
 }
 
+/** how far through the pipeline a running file is, by phase */
+const PHASE_SHARE: Record<string, number> = {
+  prepare: 0.05, wait_upload: 0.15, upload: 0.3, wait_segment: 0.6, segment: 0.7,
+};
+
 /** Overall progress in [0, 1] (null: indeterminate). */
 export function jobProgress(j: TrackedJob, stageOrder: readonly string[]): number | null {
   if (j.status === 'done') return 1;
   if (j.kind === 'batch') {
     if (j.files.length === 0) return 0;
     const settled = j.files.filter((f) => f.status !== 'pending' && f.status !== 'running').length;
-    // the running file counts by its stage, so a long file still moves the bar
-    const runningIdx = stageOrder.indexOf(j.stage);
-    const partial = j.files.some((f) => f.status === 'running') && runningIdx >= 0
-      ? runningIdx / stageOrder.length : 0;
+    // running files count by their pipeline phase (several are in flight at
+    // once), so a long file still moves the bar
+    const partial = j.files
+      .filter((f) => f.status === 'running')
+      .reduce((sum, f) => sum + (PHASE_SHARE[f.phase ?? ''] ?? 0), 0);
     return Math.min(1, (settled + partial) / j.files.length);
   }
   if (j.kind === 'run' || j.kind === 'process') {

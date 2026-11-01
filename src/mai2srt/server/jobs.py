@@ -39,6 +39,9 @@ class Job:
     #: what the job was started with (paths, use_llm): lets a client that
     #: lost its own copy (page switch, webview reload) show and re-attach it
     meta: dict = field(default_factory=dict)
+    #: a live handle on the running work (a batch's BatchQueue), for requests
+    #: that change a job while it runs (append / remove files)
+    control: Any = None
 
     @property
     def settled(self) -> bool:

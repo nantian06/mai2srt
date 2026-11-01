@@ -123,28 +123,46 @@ function JobCard({ job: j, onFail }: { job: TrackedJob; onFail: (e: unknown) => 
     if (expanded && tab === 'log') logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [expanded, tab, j.logs]);
 
-  const Icon = KIND_ICON[j.kind] ?? AudioLines;
+  // media always runs as a queue: one file reads like a single transcription
+  const kind: JobKind = j.kind === 'batch' && (j.files.length || j.meta.audio_paths?.length || 0) <= 1
+    ? 'run' : j.kind;
+  const Icon = KIND_ICON[kind] ?? AudioLines;
   const st = STATUS_STYLE[j.status];
   const progress = jobProgress(j, STAGE_IDS);
   const stage = STAGES.find((s) => s.id === j.stage);
   const end = j.finishedAt ?? Date.now();
 
+  const batchPaths = j.meta.audio_paths ?? [];
+  const batchCount = j.files.length || batchPaths.length;
   const title = j.kind === 'batch'
-    ? tf('k.batchTitle', { n: j.files.length || j.meta.audio_paths?.length || 0 })
+    ? batchCount === 1
+      ? baseName(j.files[0]?.audio ?? batchPaths[0] ?? j.title)
+      : tf('k.batchTitle', { n: batchCount })
     : j.kind === 'run' && j.meta.audio_path ? baseName(j.meta.audio_path)
     : j.kind === 'process' && j.meta.mai_json_path ? baseName(j.meta.mai_json_path)
     : j.kind === 'login' || j.kind === 'consent' ? t(`k.kind.${j.kind}` as Key)
     : j.title;
   const subtitle = j.kind === 'run' ? j.meta.audio_path
-    : j.kind === 'process' ? j.meta.mai_json_path : undefined;
+    : j.kind === 'process' ? j.meta.mai_json_path
+    : j.kind === 'batch' && batchCount === 1 ? (j.files[0]?.audio ?? batchPaths[0])
+    : undefined;
 
   const settled = j.files.filter((f) => f.status !== 'pending' && f.status !== 'running').length;
-  const current = j.kind === 'batch' ? j.files.find((f) => f.status === 'running') : undefined;
+  // a batch of several files is a pipeline: several run at once, each row
+  // names its own phase, so the header shows no single "current" stage
+  const showStage = j.kind !== 'batch' || batchCount <= 1;
   const errorText = j.status === 'error' ? (j.lost ? t('k.lost') : j.error) : '';
 
   const refine = (jsonPath: string) =>
     openProject(jsonPath).then(() => nav('refine')).catch(onFail);
-  const single = j.result && !j.result.items ? j.result : null;
+  const sole = j.result?.items?.length === 1 && j.result.items[0].status === 'done'
+    ? j.result.items[0] : null;
+  const single = j.result && !j.result.items ? j.result
+    : sole ? {
+        srt_path: sole.srt, json_path: sole.json, words: sole.words,
+        entries: sole.entries, llm_note: sole.llm_note,
+      }
+    : null;
 
   return (
     <Card className="flex flex-col gap-3 p-4">
@@ -156,7 +174,7 @@ function JobCard({ job: j, onFail }: { job: TrackedJob; onFail: (e: unknown) => 
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span className="shrink-0 text-[11px] font-medium text-ink-3">
-              {t(`k.kind.${j.kind}` as Key)}
+              {t(`k.kind.${kind}` as Key)}
             </span>
             <span className="truncate text-[14px] font-semibold text-ink-1" title={subtitle}>
               {title}
@@ -170,15 +188,10 @@ function JobCard({ job: j, onFail }: { job: TrackedJob; onFail: (e: unknown) => 
           <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11.5px] text-ink-3">
             <span>{tf('k.started', { time: fmtClock(j.createdAt) })}</span>
             <span className="font-mono">{tf('k.elapsed', { dur: fmtDur(end - j.createdAt) })}</span>
-            {j.kind === 'batch' && j.files.length > 0 && (
+            {j.kind === 'batch' && j.files.length > 1 && (
               <span>{tf('k.settled', { n: settled, total: j.files.length })}</span>
             )}
-            {isRunning && current && (
-              <span className="truncate text-ink-2" title={current.audio}>
-                {tf('t.batch.progress', { i: current.index + 1, n: j.files.length })} · {baseName(current.audio)}
-              </span>
-            )}
-            {isRunning && stage && (
+            {isRunning && showStage && stage && (
               <span className="text-primary">
                 {t(stage.label)}{j.stageDetail ? ` · ${j.stageDetail}` : ''}
               </span>
@@ -240,7 +253,7 @@ function JobCard({ job: j, onFail }: { job: TrackedJob; onFail: (e: unknown) => 
       )}
 
       {/* outcome line */}
-      {j.status === 'done' && j.result?.items && (
+      {j.status === 'done' && j.result?.items && !sole && (
         <p className="text-[12px] text-ink-2">
           {tf('t.batch.summary', {
             done: j.result.done ?? 0, skipped: j.result.skipped ?? 0, failed: j.result.failed ?? 0,
@@ -314,8 +327,8 @@ function JobCard({ job: j, onFail }: { job: TrackedJob; onFail: (e: unknown) => 
                 <BatchQueue
                   bare
                   files={j.files}
-                  selected={j.meta.audio_paths ?? []}
-                  runningNote={stage ? t(stage.label) : undefined}
+                  selected={batchPaths}
+                  fileDetail={j.fileDetail}
                   onRefine={(f: BatchFile) => refine(f.json)}
                   onReveal={(f: BatchFile) => revealPath(f.srt).catch(onFail)}
                 />
