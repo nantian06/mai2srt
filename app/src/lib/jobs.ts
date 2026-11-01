@@ -188,7 +188,12 @@ async function recover(id: string) {
   try {
     const list = await fetchJobs();
     if (!streams.has(id)) return;
-    const s = list.find((x) => x.id === id);
+    const found = list.find((x) => x.id === id);
+    // ids restart with a new backend process: a job under the same id but
+    // created at another time is a different job, not this one to resume
+    const known = jobs.get(id);
+    const s = found && known && found.created_at
+      && Math.abs(known.createdAt - found.created_at * 1000) > 1 ? undefined : found;
     if (s && s.status !== 'running' && s.status !== 'queued'
         && (s.events ?? Infinity) <= st.seen) {
       // settled and every event already seen (a job that wound down without

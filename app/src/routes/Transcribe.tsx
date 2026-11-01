@@ -6,7 +6,7 @@ import { BatchQueue } from '../components/BatchQueue';
 import { Button, Card, StatusDot, Toggle, useToast } from '../components/ui';
 import { useI18n, type Key } from '../lib/i18n';
 import {
-  cancelJob, getSubtitleParams, getSystem, preflight, revealPath,
+  cancelJob, getSubtitleParams, getSystem, openProject, preflight, revealPath,
   warmParams, warmSystem, withBackendRetry,
   type PreflightKey, type SubtitleParams, type SystemInfo,
 } from '../lib/api';
@@ -101,6 +101,18 @@ export function TranscribePage() {
   const error = startError
     || (job?.status === 'error' ? (job.lost ? t('k.lost') : job.error)
       : job?.status === 'cancelled' ? t('t.toast.cancelled') : '');
+
+  // refine loads the backend's last-opened project, which another page
+  // (Tasks, storage) may have moved on since this result was produced:
+  // point it back at this result first. A batch's hand-off is the last file
+  // it finished, as the backend's own persist() leaves it.
+  const toRefine = () => {
+    const last = result?.items?.filter((f) => f.status === 'done').at(-1);
+    const target = result?.json_path || last?.json;
+    const nav = () => window.dispatchEvent(new CustomEvent('mai2srt:nav', { detail: 'refine' }));
+    if (!target) { nav(); return; }
+    openProject(target).then(nav).catch((e) => toast('error', String(e).slice(0, 160)));
+  };
 
   // write-through: the next mount starts from here
   useEffect(() => {
@@ -551,7 +563,7 @@ export function TranscribePage() {
       {result && (!result.items || (result.done ?? 0) > 0) && (
         <div>
           <button
-            onClick={() => window.dispatchEvent(new CustomEvent('mai2srt:nav', { detail: 'refine' }))}
+            onClick={toRefine}
             className="inline-flex h-9 items-center justify-center gap-2 rounded-(--radius-s) bg-primary px-5 text-[13px] font-semibold text-on-primary shadow-[var(--shadow-1)] transition-all duration-(--dur-in) hover:bg-primary-hover active:brightness-95"
           >
             <SlidersHorizontal size={13} strokeWidth={2} /> {t('t.result.toRefine')}
