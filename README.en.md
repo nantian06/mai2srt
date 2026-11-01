@@ -129,7 +129,7 @@ This is where you rewrite the subtitles. The left column holds the segmentation 
 
 FFmpeg is bundled with the installer — you do **not** need to install it yourself.
 
-**Linux** is supported from source (the CLI, including batch transcription, and the dev-mode desktop app); there is no Linux installer yet. See [Linux](#linux).
+**Linux** `.deb` and `AppImage` (x86_64) release builds are now configured; future version tags will produce both installers. The current `v0.2.0` release still contains only the Windows installer. The CLI and batch transcription remain available from source; see [Linux](#linux).
 
 ---
 
@@ -207,7 +207,11 @@ Installing over an existing version, or uninstalling silently (`/S`), ignores bo
 
 ## Linux
 
-There is no packaged Linux build; the backend and the `mai2srt` command run from source. Everything below was written for a typical desktop or headless server distribution.
+The x86_64 `.deb` and `AppImage` installers will be attached to future version releases. The current `v0.2.0` release does not contain Linux packages. They are built on Ubuntu 22.04 for compatibility with Ubuntu 22.04 and compatible/newer distributions; desktop behavior has not been tested across every distribution.
+
+The `.deb` package installs FFmpeg as a package dependency. For the AppImage, install FFmpeg yourself and ensure `ffmpeg` and `ffprobe` are on `PATH` (for example, `sudo apt install ffmpeg`). AppImage also requires the distribution's WebKitGTK 4.1 runtime; on Ubuntu, install `libwebkit2gtk-4.1-0`.
+
+To run the CLI from source instead:
 
 **Install**
 
@@ -398,6 +402,8 @@ This tool was written for personal study and low-frequency use. The playground i
 ## License
 
 mai2srt is released under the [GNU General Public License v3](./LICENSE). Third-party components bundled in the installer keep their own licenses — see [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md).
+
+Development docs: [Design](docs/design.md) · [Maintenance changelog](docs/changelog.md) · [Release notes](docs/release-notes/v0.2.0.md).
 
 ---
 

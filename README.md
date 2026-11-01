@@ -129,7 +129,7 @@ mai2srt 把这些补齐：超限文件自动压缩、按静音分块，词级时
 
 FFmpeg 已随安装包内置，**不需要**自行安装。
 
-**Linux** 支持从源码运行（CLI，含批量转录；桌面应用目前只有开发模式），暂无 Linux 安装包，详见 [Linux](#linux)。
+**Linux** 的 `.deb` 与 `AppImage`（x86_64）发版构建已加入工作流，后续版本标签会生成这两种安装包；当前 `v0.2.0` Release 仍只有 Windows 安装包。源码运行仍支持 CLI 和批量转录，详见 [Linux](#linux)。
 
 ---
 
@@ -205,7 +205,11 @@ Windows 设置 → 应用 → 已安装的应用 → mai2srt → 卸载（或在
 
 ## Linux
 
-暂无 Linux 安装包，后端与 `mai2srt` 命令从源码运行。
+x86_64 的 `.deb` 与 `AppImage` 安装包将在后续版本发布时附上；当前 `v0.2.0` Release 尚不包含 Linux 包。构建基线为 Ubuntu 22.04，面向 Ubuntu 22.04 及兼容/更新的发行版；尚未在所有发行版上测试桌面运行效果。
+
+`.deb` 会由包管理器安装 FFmpeg 依赖。使用 AppImage 前，需要自行安装 FFmpeg，并确保 `ffmpeg`、`ffprobe` 位于 `PATH` 中（例如 `sudo apt install ffmpeg`）。AppImage 也需要发行版提供 WebKitGTK 4.1 运行库；Ubuntu 上可安装 `libwebkit2gtk-4.1-0`。
+
+如需从源码运行 CLI：
 
 **安装**
 
@@ -395,6 +399,8 @@ A：OpenAI 兼容、Anthropic、Gemini 三种格式都能用。同一家换个�
 ## 开源协议
 
 mai2srt 以 [GNU 通用公共许可证第 3 版](./LICENSE) 发布。安装包内的第三方组件保留各自许可证，见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
+
+开发文档：[设计说明](docs/design.md) · [维护日志](docs/changelog.md) · [版本说明](docs/release-notes/v0.2.0.md)。
 
 ---
 

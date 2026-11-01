@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "externalBin": [],
+    "resources": [
+      "backend/mai2srt-backend/",
+      "backend/ffmpeg/",
+      "backend/licenses/"
+    ]
+  }
+}

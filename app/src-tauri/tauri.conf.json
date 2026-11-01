@@ -63,6 +63,14 @@
         "installerHooks": "./nsis/hooks.nsh"
       }
     },
+    "linux": {
+      "deb": {
+        "depends": ["ffmpeg"]
+      },
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/64x64.png",
