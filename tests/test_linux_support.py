@@ -64,11 +64,22 @@ def test_linux_hints_cover_chrome_edge_and_system_chromium():
         assert needle in src
 
 
-def test_find_channel_exe_skips_snap_chromium(monkeypatch):
+def test_find_channel_exe_skips_snap_chromium(monkeypatch, tmp_path):
     monkeypatch.setitem(br.CHANNEL_HINTS, "chromium-system",
                         (["chromium"], ["/nonexistent/chromium"]))
     monkeypatch.setattr(br.shutil, "which", lambda n: "/snap/bin/chromium")
     assert br.find_channel_exe("chromium-system") is None
+
+
+def test_ubuntu_launcher_shim_for_the_snap_is_skipped(monkeypatch, tmp_path):
+    shim = tmp_path / "chromium-browser"
+    shim.write_text("#!/bin/sh\nexec /snap/bin/chromium \"$@\"\n", encoding="utf-8")
+    real = tmp_path / "chromium"
+    real.write_bytes(b"\x7fELF" + b"\0" * 20000)
+    monkeypatch.setitem(br.CHANNEL_HINTS, "chromium-system", (["x"], [str(shim)]))
+    assert br.find_channel_exe("chromium-system") is None
+    monkeypatch.setitem(br.CHANNEL_HINTS, "chromium-system", (["x"], [str(real)]))
+    assert br.find_channel_exe("chromium-system") == str(real)
 
 
 def test_system_chromium_is_the_last_resort_when_bundled_is_absent(monkeypatch, tmp_path):

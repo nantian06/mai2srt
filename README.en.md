@@ -8,7 +8,7 @@
 
 Drop in audio or video, get a word-level transcript, fix the segmentation the way you like it, export a standard SRT.
 
-Free transcription · no GPU · Windows 10 / 11
+Free transcription · no GPU · Windows 10 / 11 (desktop app) · Linux (CLI & batch, from source)
 
 <br />
 
@@ -129,6 +129,8 @@ This is where you rewrite the subtitles. The left column holds the segmentation 
 
 FFmpeg is bundled with the installer — you do **not** need to install it yourself.
 
+**Linux** is supported from source (the CLI, including batch transcription, and the dev-mode desktop app); there is no Linux installer yet. See [Linux](#linux).
+
 ---
 
 ## Install
@@ -201,6 +203,43 @@ Installing over an existing version, or uninstalling silently (`/S`), ignores bo
 
 ---
 
+## Linux
+
+There is no packaged Linux build; the backend and the `mai2srt` command run from source. Everything below was written for a typical desktop or headless server distribution.
+
+**Install**
+
+```bash
+sudo apt install ffmpeg            # or: sudo dnf install ffmpeg / sudo pacman -S ffmpeg
+git clone https://github.com/fuxiaomoke/mai2srt.git && cd mai2srt
+pip install -e .[dev]
+playwright install chromium        # only if the machine has no Google Chrome / Chromium / Microsoft Edge
+```
+
+Browser discovery order: Google Chrome → Microsoft Edge → playwright's own chromium → the distro's `chromium` package (a snap-packaged chromium is not used: it cannot read the profile folder under your home directory). FFmpeg is not bundled on Linux; it must be on `PATH`.
+
+**Signing in on a machine without a display (servers, containers)**
+
+Signing in needs a visible browser. Do it once where you have a desktop, then move the session across:
+
+```bash
+# on the desktop machine
+mai2srt login
+mai2srt session export session.json     # the file is a login credential: keep it private (it is written chmod 600)
+
+# on the server
+mai2srt session import session.json     # then delete session.json
+mai2srt consent                         # first time only, see the FAQ
+```
+
+When the session expires, repeat the export / import. Without a display, `mai2srt login` stops with a message pointing here instead of failing inside the browser.
+
+**Data locations** are the same as on Windows: `~/.mai2srt/` for sessions, settings and logs, and `~/Documents/mai2srt/` for the project library.
+
+**Desktop app in dev mode**: `./dev.sh` (needs Node ≥ 20, pnpm, a Rust toolchain and Tauri's Linux system packages). This path is not covered by tests yet.
+
+---
+
 ## Build from source
 
 Python ≥ 3.10, Node ≥ 20, pnpm, a Rust toolchain, and FFmpeg on PATH — then:
@@ -219,7 +258,7 @@ To produce an installer, run `scripts\release.ps1` (ffmpeg -> backend sidecar ->
 
 ## Command line
 
-The GUI covers everyday use; the CLI is for scripting and automation — one file per run, and for batch work you can write a loop around it. The `mai2srt` command comes from the Python package (see Build from source above); the installer does not put it on PATH. Logs go to the terminal and to `~/.mai2srt/logs/mai2srt.log`; add `-v` for debug output.
+The GUI covers everyday use; the CLI is for scripting and automation, and `mai2srt batch` handles whole folders. The `mai2srt` command comes from the Python package (see Build from source above); the installer does not put it on PATH. Logs go to the terminal and to `~/.mai2srt/logs/mai2srt.log`; add `-v` for debug output.
 
 ```powershell
 # login: opens a browser to sign in; the session persists (no repeated sign-ins)
@@ -246,6 +285,33 @@ mai2srt process "abc.mai.json" --no-llm                # skip the LLM, punctuati
 mai2srt run "abc.wav"
 mai2srt run "abc.wav" --out D:\out\abc.srt --json D:\out\abc.mai.json
 ```
+
+### Batch transcription
+
+```bash
+mai2srt batch ~/recordings                        # every audio/video file in the folder
+mai2srt batch ~/recordings -r                     # ...including subfolders
+mai2srt batch a.mp3 b.mp4 ~/more                  # files and folders mixed
+mai2srt batch ~/recordings --out-dir ~/subs       # collect every .srt in one folder
+mai2srt batch ~/recordings --dry-run              # list what would run, be re-segmented, or be skipped; changes nothing
+mai2srt batch ~/recordings --report report.json   # also write a machine-readable summary
+```
+
+- **One browser session for the whole batch**, started once, so a hundred files do not mean a hundred browser launches. Files go one at a time by default; `--jobs 2` or `--jobs 3` upload in parallel (the ceiling is 3 — the playground is a free shared service, raise it with care).
+- **Safe to re-run.** A file counts as finished when both its transcript (in the project library) and its `.srt` exist, and finished files are skipped. A file with a transcript but no `.srt` is only re-segmented — nothing is uploaded again. `--overwrite` redoes everything.
+- **Failures are contained.** A bad file (corrupt media, one upload that keeps failing) is recorded and the batch carries on; the summary at the end lists what happened and the exit code is non-zero if anything failed. Problems that would sink every file — not signed in, an expired session, the biometric notice (HTTP 451), no usable browser — stop the batch immediately and say how to fix it.
+- **Ctrl-C** stops the current file, prints what was finished, and exits with code 130. Re-run the same command to continue.
+- `--out-dir` collects the subtitles in one folder. Files with the same name from different folders get a short hash in the name (`clip-3fa9c1.srt`) rather than overwriting each other. Without `--out-dir`, each `.srt` lands next to its source, as with `run`.
+- Segmentation options (`--no-llm`, `--max-chars`, …) work as for `run`. If an LLM call fails the file falls back to rule-based splitting, and the summary counts it under "LLM fallback".
+
+### Moving a sign-in between machines
+
+```bash
+mai2srt session export session.json    # write the active account's session to a file (chmod 600)
+mai2srt session import session.json    # install it on another machine; it becomes the active account
+```
+
+The file is a login credential — anyone holding it can use the account. Keep it private and delete it after importing.
 
 There is also `mai2srt serve --port 47613`: the backend the GUI talks to. The app starts it by itself, so you rarely run it by hand (development aside).
 

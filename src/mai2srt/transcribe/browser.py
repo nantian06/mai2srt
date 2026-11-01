@@ -76,6 +76,22 @@ else:
 _PLAYWRIGHT_CHANNELS = ("chrome", "msedge")
 
 
+def _is_snap(path: str) -> bool:
+    """A snap-confined browser, directly or behind a launcher shim.
+
+    Ubuntu's /usr/bin/chromium(-browser) is a tiny script that execs the snap;
+    the snap sandbox cannot read the dot-directory profile under $HOME, so
+    driving it fails in confusing ways.
+    """
+    try:
+        if "/snap/" in os.path.realpath(path):
+            return True
+        p = Path(path)
+        return p.stat().st_size < 8192 and b"/snap/" in p.read_bytes()
+    except OSError:
+        return False
+
+
 def find_channel_exe(channel: str) -> str | None:
     """Locate a real browser executable for a playwright channel."""
     hint = CHANNEL_HINTS.get(channel)
@@ -84,10 +100,10 @@ def find_channel_exe(channel: str) -> str | None:
     names, paths = hint
     for exe in names:
         hit = shutil.which(exe)
-        if hit and "/snap/" not in hit:
+        if hit and not _is_snap(hit):
             return hit
     for p in paths:
-        if Path(p).exists():
+        if Path(p).exists() and not _is_snap(p):
             return p
     return None
 
