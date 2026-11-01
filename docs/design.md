@@ -18,6 +18,12 @@ This document describes the desktop packaging boundary. Application behavior and
 | `.deb` | Ubuntu 22.04, x86_64 | Declared as a package dependency | GTK 3 and WebKitGTK 4.1 runtime libraries |
 | AppImage | Ubuntu 22.04, x86_64 | Not bundled; `ffmpeg` and `ffprobe` must be on `PATH` | GStreamer/media framework bundling is enabled; host FUSE support may be needed |
 
+### Media playback on Linux
+
+WebKitGTK plays the refine page's audio through GStreamer. A stock install has gst-plugins-base and -good only, which is also what the AppImage bundles, and that set has no AAC decoder: an AAC stream fails with `Missing decoder: MPEG-4 AAC`. mp3, Opus, Vorbis, FLAC and WAV decode with it.
+
+The backend therefore decides per platform which files `/api/audio` serves as they are (`media/playback.py`, `direct_play_mimes()`). On Linux, AAC — video soundtracks and `.m4a` / `.aac` files — goes through the audio extraction cache as mp3. An old `.m4a` cache entry is not a hit and is deleted once its mp3 replacement exists. Windows (WebView2) and macOS keep the lossless remux. Do not drop this rule by adding gst-libav to one package: the `.deb` uses the system's GStreamer, which may not have it.
+
 ## Build and release flow
 
 `.github/workflows/release.yml` builds Linux `.deb` and AppImage alongside the existing Windows NSIS installer. Branch pushes and manual runs are for validation and upload workflow artifacts; formal GitHub Release publishing remains gated on version tags. Do not treat a branch artifact as a published release.
