@@ -8,7 +8,6 @@ APP_DIR="$ROOT/app"
 TAURI_DIR="$APP_DIR/src-tauri"
 STAGE_DIR="$TAURI_DIR/backend"
 DIST_DIR="$ROOT/dist"
-TRIPLE="x86_64-unknown-linux-gnu"
 
 cd "$ROOT"
 
@@ -62,15 +61,14 @@ if [[ ! -x "$BUILT_EXE" || ! -d "$BUILT_DIR/_internal" ]]; then
 fi
 
 echo "==> [3/6] staging sidecar and notices ..."
-mkdir -p "$STAGE_DIR/_internal" "$STAGE_DIR/ffmpeg" "$STAGE_DIR/licenses"
-install -m 0755 "$BUILT_EXE" "$STAGE_DIR/mai2srt-backend-$TRIPLE"
-cp -a "$BUILT_DIR/_internal/." "$STAGE_DIR/_internal/"
+mkdir -p "$STAGE_DIR/mai2srt-backend" "$STAGE_DIR/ffmpeg" "$STAGE_DIR/licenses"
+cp -a "$BUILT_DIR/." "$STAGE_DIR/mai2srt-backend/"
 cp "$ROOT/packaging/linux/ffmpeg-README.txt" "$STAGE_DIR/ffmpeg/README.txt"
 cp "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.md" "$STAGE_DIR/licenses/"
 cp "$ROOT"/licenses/*.txt "$STAGE_DIR/licenses/"
 
 echo "==> [4/6] smoke-testing the staged sidecar ..."
-python3 "$ROOT/scripts/smoke-linux-backend.py" "$STAGE_DIR/mai2srt-backend-$TRIPLE"
+python3 "$ROOT/scripts/smoke-linux-backend.py" "$STAGE_DIR/mai2srt-backend/mai2srt-backend"
 
 echo "==> [5/6] building .deb and AppImage ..."
 (
@@ -102,7 +100,7 @@ if [[ "$DEB_DEPENDS" != *ffmpeg* ]]; then
     exit 1
 fi
 DEB_CONTENTS="$(dpkg-deb --contents "${DEB_FILES[0]}")"
-if [[ "$DEB_CONTENTS" != *"mai2srt-backend"* ]]; then
+if [[ "$DEB_CONTENTS" != *"backend/mai2srt-backend/mai2srt-backend"* ]]; then
     echo ".deb does not contain the Linux backend sidecar" >&2
     exit 1
 fi
@@ -116,9 +114,9 @@ trap 'rm -rf "$EXTRACT_DIR"' EXIT
 DEB_ROOT="$EXTRACT_DIR/deb"
 mkdir -p "$DEB_ROOT"
 dpkg-deb --extract "${DEB_FILES[0]}" "$DEB_ROOT"
-DEB_SIDECAR="$(find "$DEB_ROOT" -type f -name 'mai2srt-backend*' -print -quit)"
-if [[ -z "$DEB_SIDECAR" || ! -x "$DEB_SIDECAR" ]]; then
-    echo ".deb backend sidecar is missing or not executable" >&2
+DEB_SIDECAR="$(find "$DEB_ROOT" -type f -path '*/backend/mai2srt-backend/mai2srt-backend' -print -quit)"
+if [[ -z "$DEB_SIDECAR" || ! -x "$DEB_SIDECAR" || ! -d "$(dirname "$DEB_SIDECAR")/_internal" ]]; then
+    echo ".deb backend onedir resources are missing or incomplete" >&2
     exit 1
 fi
 python3 "$ROOT/scripts/smoke-linux-backend.py" "$DEB_SIDECAR"
@@ -128,9 +126,9 @@ mkdir -p "$APPIMAGE_ROOT"
     cd "$APPIMAGE_ROOT"
     "${APPIMAGE_FILES[0]}" --appimage-extract >/dev/null
 )
-SIDECAR_PATH="$(find "$APPIMAGE_ROOT/squashfs-root" -type f -name 'mai2srt-backend*' -print -quit)"
-if [[ -z "$SIDECAR_PATH" || ! -x "$SIDECAR_PATH" ]]; then
-    echo "AppImage backend sidecar is missing or not executable" >&2
+SIDECAR_PATH="$(find "$APPIMAGE_ROOT/squashfs-root" -type f -path '*/backend/mai2srt-backend/mai2srt-backend' -print -quit)"
+if [[ -z "$SIDECAR_PATH" || ! -x "$SIDECAR_PATH" || ! -d "$(dirname "$SIDECAR_PATH")/_internal" ]]; then
+    echo "AppImage backend onedir resources are missing or incomplete" >&2
     exit 1
 fi
 python3 "$ROOT/scripts/smoke-linux-backend.py" "$SIDECAR_PATH"

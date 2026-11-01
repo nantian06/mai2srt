@@ -1,6 +1,6 @@
 /// mai2srt Tauri shell: thin glue only -- all real logic lives in the
-/// Python sidecar (dev: dev.mjs spawns `mai2srt serve`; release: the
-/// bundled sidecar binary below).
+/// Python sidecar (dev: dev.mjs spawns `mai2srt serve`; release: Windows
+/// externalBin or the Linux onedir resource tree).
 ///
 /// Release-mode sidecar contract:
 ///  - spawned once at setup with `serve --port 47613`; the frontend's
@@ -82,7 +82,48 @@ fn show_watchdog(app: tauri::AppHandle) {
     });
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), target_os = "linux"))]
+mod sidecar {
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Mutex;
+
+    use tauri::{path::BaseDirectory, AppHandle, Manager};
+
+    static CHILD: Mutex<Option<Child>> = Mutex::new(None);
+
+    pub fn spawn(app: &AppHandle) {
+        let executable = match app.path().resolve(
+            "backend/mai2srt-backend/mai2srt-backend",
+            BaseDirectory::Resource,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("sidecar resource resolve failed: {error}");
+                return;
+            }
+        };
+
+        match Command::new(&executable)
+            .args(["serve", "--port", "47613"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => *CHILD.lock().unwrap() = Some(child),
+            Err(error) => eprintln!("sidecar spawn failed at {}: {error}", executable.display()),
+        }
+    }
+
+    pub fn kill() {
+        if let Some(mut child) = CHILD.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(all(not(debug_assertions), not(target_os = "linux")))]
 mod sidecar {
     use std::sync::Mutex;
     use tauri::AppHandle;
@@ -106,9 +147,7 @@ mod sidecar {
                 // output to the log file, so these pipes carry nothing --
                 // but an unread pipe is a deadlock hazard if that ever
                 // changes, so consume and discard regardless
-                tauri::async_runtime::spawn(async move {
-                    while rx.recv().await.is_some() {}
-                });
+                tauri::async_runtime::spawn(async move { while rx.recv().await.is_some() {} });
             }
             Err(e) => eprintln!("sidecar spawn failed: {e}"),
         }
