@@ -1,6 +1,7 @@
 """mai2srt command line: login / consent / transcribe / process / run.
 
     mai2srt login
+    mai2srt session export <file> | import <file>   # move a login between machines
     mai2srt consent             # accept the playground biometric notice once
     mai2srt transcribe <audio> [--out out.mai.json]
                         [--keep-conversation] [--include-raw]
@@ -34,6 +35,7 @@ from .runner import (
     run_full,
     transcribe_audio,
 )
+from .transcribe.browser import NoDisplayError
 from .transcribe.client import TranscribeError
 from .transcribe.persist import load_mai_json
 
@@ -68,7 +70,7 @@ async def cmd_login(cfg: Config, account: str | None = None) -> int:
         log.info("signing in account '%s'", name)
     try:
         await login_flow(cfg, on_log=log.info, consent=_consent_prompt)
-    except TranscribeError as e:
+    except (TranscribeError, NoDisplayError) as e:
         log.error("%s", e)
         return 1
     log.info("signed in; session persisted under %s", cfg.data_dir)
@@ -100,6 +102,24 @@ async def _consent_prompt() -> bool:
           end="", flush=True)
     answer = await asyncio.to_thread(input)
     return answer.strip().lower() in ("y", "yes")
+
+
+def cmd_session(cfg: Config, args: argparse.Namespace) -> int:
+    from .session_io import SessionIOError, export_session, import_session
+    try:
+        if args.action == "export":
+            name = export_session(cfg, Path(args.file), account=args.account)
+            log.info("exported account '%s' -> %s", name, args.file)
+            log.warning("this file is a login credential (anyone holding it can "
+                        "use the account): keep it private and delete it after "
+                        "importing")
+        else:
+            name = import_session(cfg, Path(args.file), account=args.account)
+            log.info("imported account '%s'; it is now the active account", name)
+    except SessionIOError as e:
+        log.error("%s", e)
+        return 1
+    return 0
 
 
 async def cmd_consent(cfg: Config) -> int:
@@ -242,6 +262,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="sign into this named account (created if new); "
                          "each account keeps its own cookies + browser profile")
 
+    ssp = sub.add_parser(
+        "session", help="export/import the signed-in session (for headless "
+                        "machines that cannot open a browser to sign in)")
+    ssp.add_argument("action", choices=["export", "import"])
+    ssp.add_argument("file")
+    ssp.add_argument("--account", default=None,
+                     help="export: which account (default active); "
+                          "import: store under this name")
+
     cp = sub.add_parser(
         "consent", help="accept the playground biometric notice once "
                         "(unblocks audio uploads rejected with HTTP 451)")
@@ -282,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "login":
         return asyncio.run(cmd_login(cfg, account=args.account))
+    if args.cmd == "session":
+        return cmd_session(cfg, args)
     if args.cmd == "consent":
         return asyncio.run(cmd_consent(cfg))
     if args.cmd == "transcribe":

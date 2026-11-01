@@ -1,0 +1,30 @@
+name: ci
+
+# PR-level checks. release.yml only runs on a version tag, so without this
+# nothing exercised the backend between releases -- and nothing at all ran on
+# Linux.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install backend + test deps
+        run: pip install -e ".[dev]"
+
+      - name: Tests
+        run: python -m pytest tests -q

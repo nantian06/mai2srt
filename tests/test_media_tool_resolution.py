@@ -25,6 +25,7 @@ from mai2srt.media.probe import (  # noqa: E402
     MediaError,
     resolve_tool,
     resolve_tool_ex,
+    tool_filename,
 )
 from mai2srt.server.app import create_app  # noqa: E402
 
@@ -41,7 +42,7 @@ def _sidecar(tmp_path: Path, *, bundle: bool) -> Path:
     """A fake frozen layout: the sidecar exe, optionally with ffmpeg beside it."""
     exe = _write(tmp_path / "mai2srt-backend.exe")
     if bundle:
-        _write(tmp_path / "ffmpeg" / "ffmpeg.exe")
+        _write(tmp_path / "ffmpeg" / tool_filename("ffmpeg"))
     return exe
 
 
@@ -50,7 +51,7 @@ def _checkout(tmp_path: Path, *, vendored: bool) -> Path:
     root = tmp_path / "checkout"
     _write(root / "pyproject.toml")
     if vendored:
-        _write(root / "vendor" / "ffmpeg" / "ffmpeg.exe")
+        _write(root / "vendor" / "ffmpeg" / tool_filename("ffmpeg"))
     return root
 
 
@@ -62,7 +63,7 @@ def test_frozen_prefers_the_copy_beside_the_sidecar(monkeypatch, tmp_path):
     monkeypatch.setattr("shutil.which", lambda name: PATH_FFMPEG)
     path, source = resolve_tool_ex("ffmpeg")
     assert source == SOURCE_BUNDLED
-    assert Path(path) == tmp_path / "ffmpeg" / "ffmpeg.exe"
+    assert Path(path) == tmp_path / "ffmpeg" / tool_filename("ffmpeg")
 
 
 def test_frozen_without_a_bundle_falls_back_to_path(monkeypatch, tmp_path):
@@ -91,7 +92,7 @@ def test_checkout_prefers_the_vendored_copy(monkeypatch, tmp_path):
     monkeypatch.setattr("shutil.which", lambda name: PATH_FFMPEG)
     path, source = resolve_tool_ex("ffmpeg")
     assert source == SOURCE_BUNDLED
-    assert Path(path) == root / "vendor" / "ffmpeg" / "ffmpeg.exe"
+    assert Path(path) == root / "vendor" / "ffmpeg" / tool_filename("ffmpeg")
 
 
 def test_checkout_without_vendored_binaries_uses_path(monkeypatch, tmp_path):
@@ -112,7 +113,7 @@ def test_no_checkout_at_all_uses_path(monkeypatch, tmp_path):
 def test_a_copy_beside_python_is_not_a_bundle(monkeypatch, tmp_path):
     """The frozen layout lives beside the sidecar, not beside the interpreter."""
     exe = _write(tmp_path / "python.exe")
-    _write(tmp_path / "ffmpeg" / "ffmpeg.exe")
+    _write(tmp_path / "ffmpeg" / tool_filename("ffmpeg"))
     monkeypatch.delattr(sys, "frozen", raising=False)
     monkeypatch.setattr(sys, "executable", str(exe))
     monkeypatch.setattr(probe_mod, "_repo_root", lambda: None)
@@ -126,7 +127,7 @@ def test_resolve_tool_still_returns_the_bare_path(monkeypatch, tmp_path):
     """Call sites that only run the tool must keep their signature."""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(_sidecar(tmp_path, bundle=True)))
-    assert resolve_tool("ffmpeg") == str(tmp_path / "ffmpeg" / "ffmpeg.exe")
+    assert resolve_tool("ffmpeg") == str(tmp_path / "ffmpeg" / tool_filename("ffmpeg"))
 
 
 def test_missing_tool_raises_with_the_name(monkeypatch, tmp_path):
@@ -147,3 +148,25 @@ def test_system_endpoint_reports_the_source(tmp_path, monkeypatch):
     body = client.get("/api/system").json()
     assert set(body["ffmpeg"]) >= {"found", "path", "source"}
     assert body["ffmpeg"]["source"] in (None, SOURCE_BUNDLED, SOURCE_PATH)
+
+
+# ------------------------------------------------------------------ platform
+
+def test_tool_filename_only_has_an_exe_suffix_on_windows(monkeypatch):
+    monkeypatch.setattr(probe_mod.sys, "platform", "win32")
+    assert tool_filename("ffmpeg") == "ffmpeg.exe"
+    monkeypatch.setattr(probe_mod.sys, "platform", "linux")
+    assert tool_filename("ffmpeg") == "ffmpeg"
+
+
+def test_missing_tool_on_linux_names_the_package_manager(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(probe_mod, "_repo_root", lambda: None)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(probe_mod.sys, "platform", "linux")
+    try:
+        resolve_tool_ex("ffmpeg")
+    except MediaError as e:
+        assert "apt install ffmpeg" in str(e)
+    else:
+        raise AssertionError("a missing tool must not resolve silently")

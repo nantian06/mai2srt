@@ -32,6 +32,12 @@ def _repo_root() -> Path | None:
     return None
 
 
+def tool_filename(name: str) -> str:
+    """The on-disk file name of a bundled tool: ``ffmpeg.exe`` on Windows,
+    plain ``ffmpeg`` everywhere else."""
+    return f"{name}.exe" if sys.platform == "win32" else name
+
+
 def resolve_tool_ex(name: str) -> tuple[str, str]:
     """(executable, source) for ffmpeg/ffprobe.
 
@@ -51,21 +57,32 @@ def resolve_tool_ex(name: str) -> tuple[str, str]:
     won; a bare path looks the same either way.
     """
     if getattr(sys, "frozen", False):
-        bundled = Path(sys.executable).parent / "ffmpeg" / f"{name}.exe"
+        bundled = Path(sys.executable).parent / "ffmpeg" / tool_filename(name)
         if bundled.is_file():
             return str(bundled), SOURCE_BUNDLED
     else:
         root = _repo_root()
         if root is not None:
-            vendored = root / "vendor" / "ffmpeg" / f"{name}.exe"
+            vendored = root / "vendor" / "ffmpeg" / tool_filename(name)
             if vendored.is_file():
                 return str(vendored), SOURCE_BUNDLED
     path = shutil.which(name)
     if not path:
         raise MediaError(
             f"{name} not found; install FFmpeg "
-            "(https://ffmpeg.org) or add it to PATH")
+            "(https://ffmpeg.org) or add it to PATH"
+            + install_hint(name))
     return path, SOURCE_PATH
+
+
+def install_hint(name: str = "ffmpeg") -> str:
+    """Platform-specific install advice appended to a missing-tool error."""
+    if sys.platform.startswith("linux"):
+        return (" (Linux: `sudo apt install ffmpeg` / `sudo dnf install ffmpeg` "
+                "/ `sudo pacman -S ffmpeg`)")
+    if sys.platform == "darwin":
+        return " (macOS: `brew install ffmpeg`)"
+    return ""
 
 
 def resolve_tool(name: str) -> str:

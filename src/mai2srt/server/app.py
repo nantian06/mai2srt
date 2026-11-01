@@ -256,11 +256,16 @@ def create_app(cfg: Config) -> FastAPI:
         Static and instant: the page asks on click and refuses to launch a job
         that cannot work, naming the gap instead of failing a minute later.
         """
-        from ..preflight import KIND_PROCESS, KIND_RUN, missing_requirements
+        from ..preflight import (
+            KIND_PROCESS, KIND_RUN, install_hints, missing_requirements,
+            platform_name,
+        )
         if kind not in (KIND_RUN, KIND_PROCESS):
             raise HTTPException(400, "unknown kind: %s" % kind)
         missing = missing_requirements(cfg, kind=kind, use_llm=use_llm)
-        return {"ok": not missing, "missing": missing}
+        return {"ok": not missing, "missing": missing,
+                "platform": platform_name(),
+                "hints": install_hints(missing)}
 
     # -------------------------------------------------------------- session
 
