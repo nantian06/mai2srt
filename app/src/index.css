@@ -26,6 +26,8 @@
   --color-primary: var(--primary);
   --color-primary-hover: var(--primary-hover);
   --color-on-primary: var(--on-primary);
+  --color-primary-dim: var(--primary-dim);
+  --color-hover: var(--hover);
   --color-ok: var(--success);
   --color-warn: var(--warn);
   --color-err: var(--error);
