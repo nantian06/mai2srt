@@ -112,6 +112,32 @@ def transcribe_target(cfg: Config, audio: Path) -> Path:
     return p
 
 
+def same_path(a: str | Path, b: str | Path) -> bool:
+    """Do two path spellings name the same file? Case/separator-insensitive
+    on Windows, never touches the disk."""
+    import os
+    return (os.path.normcase(os.path.abspath(a))
+            == os.path.normcase(os.path.abspath(b)))
+
+
+def find_project(cfg: Config, audio: Path) -> Path | None:
+    """The stored .mai.json that was transcribed from ``audio``, if any.
+
+    Read-only (never creates the library folder). Matches on the recorded
+    ``source`` so a numbered sibling ("clip 2.mai.json") of a same-stem
+    different file is not mistaken for this one.
+    """
+    import glob
+    d = projects_dir(cfg)
+    if not d.is_dir():
+        return None
+    for p in sorted(d.glob(glob.escape(audio.stem) + "*.mai.json")):
+        src = _read_source(p)
+        if src and same_path(src, audio):
+            return p
+    return None
+
+
 def srt_target(cfg: Config, src: Path, source: str | None,
                refined: bool = False, suffix: str | None = None) -> Path:
     """SRT export target for one mai.json: the AUDIO's folder when the

@@ -8,6 +8,8 @@
     mai2srt process <x.mai.json> [--out out.srt] [--no-llm] [tuning flags]
     mai2srt run <audio> [--out out.srt] [--json out.mai.json] [--no-llm]
               [tuning flags]
+    mai2srt batch <file|dir>... [-r] [--out-dir D] [--overwrite] [--dry-run]
+              [--jobs N] [--report r.json] [--no-llm] [tuning flags]
 
 Speaker diarization cannot be disabled: the playground server ignores
 {"diarize": false} entirely (live-verified 2026-09-26 -- an empty
@@ -215,6 +217,87 @@ async def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_batch(cfg: Config, args: argparse.Namespace) -> int:
+    """Many files, one browser session; resumable (see mai2srt.batch)."""
+    from . import batch as b
+
+    files, problems = b.collect_inputs(args.inputs, recursive=args.recursive)
+    for msg in problems:
+        log.warning("%s", msg)
+    if not files:
+        log.error("no input files")
+        return 2
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else None
+    items = b.plan_batch(cfg, files, out_dir=out_dir, overwrite=args.overwrite)
+
+    if args.dry_run:
+        print(b.format_plan(items))
+        return 0
+
+    needs_upload = any(i.action == b.ACT_TRANSCRIBE for i in items)
+    if needs_upload:
+        # the LLM is optional here (segmentation degrades to rules), so it is
+        # not a prerequisite; ffmpeg / browser / a saved login are
+        from .preflight import install_hints, missing_requirements
+        missing = missing_requirements(cfg, use_llm=False)
+        if missing:
+            hints = install_hints(missing)
+            for key in missing:
+                log.error("missing prerequisite: %s%s", key,
+                          "  ->  " + hints[key] if key in hints else "")
+            return 1
+
+    sp, pp = _tuned_params(args)
+    report = b.BatchReport(items)
+    order = {id(it): n for n, it in enumerate(items, 1)}
+    total = len(items)
+
+    def started(idx: int, tot: int, it: b.BatchItem) -> None:
+        log.info("[%d/%d] %s  %s", idx + 1, tot, it.action, it.audio)
+
+    def finished(idx: int, tot: int, it: b.BatchItem) -> None:
+        if it.status == b.ST_DONE:
+            log.info("[%d/%d] ok  %d lines, %.0fs%s", idx + 1, tot, it.entries,
+                     it.seconds, "  (LLM fell back to rules)" if it.llm_note else "")
+        elif it.status == b.ST_FAILED:
+            log.error("[%d/%d] FAILED  %s", idx + 1, tot,
+                      it.detail.splitlines()[0][:300] if it.detail else "")
+
+    def on_log(it: b.BatchItem, msg: str) -> None:
+        n = order.get(id(it))
+        log.info("%s%s", "[%d/%d] " % (n, total) if n else "", msg)
+
+    async def go() -> None:
+        await b.run_batch(
+            cfg, report,
+            keep=_resolve_keep(cfg, args), include_raw=args.include_raw,
+            segment_params=sp, post_params=pp, use_llm=not args.no_llm,
+            jobs=args.jobs, on_item_start=started, on_item_done=finished,
+            on_log=on_log, on_consent=_consent_prompt)
+
+    interrupted = False
+    try:
+        asyncio.run(go())
+    except KeyboardInterrupt:
+        interrupted = True
+        report.interrupted = True
+        for it in report.items:
+            if it.status in (b.ST_RUNNING, b.ST_PENDING):
+                it.status = b.ST_CANCELLED
+
+    print()
+    print(b.format_summary(report))
+    if args.report:
+        try:
+            _write_doc(Path(args.report), report.to_dict())
+            log.info("report written to %s", args.report)
+        except OSError as e:
+            log.error("cannot write report: %s", e)
+    if interrupted:
+        return 130
+    return 0 if report.ok else 1
+
+
 def cmd_serve(cfg: Config, args: argparse.Namespace) -> int:
     import uvicorn
     from .server.app import create_app
@@ -302,6 +385,32 @@ def main(argv: list[str] | None = None) -> int:
                     help="skip LLM split-point selection (deterministic only)")
     _add_tuning(rp)
 
+    bp = sub.add_parser(
+        "batch", help="many audio/video files -> SRT, one browser session; "
+                      "re-running skips finished files")
+    bp.add_argument("inputs", nargs="+",
+                    help="media files and/or folders")
+    bp.add_argument("-r", "--recursive", action="store_true",
+                    help="descend into subfolders of the given folders")
+    bp.add_argument("--out-dir", default=None,
+                    help="write every .srt here (default: next to each "
+                         "source); same-named sources get a short hash suffix")
+    bp.add_argument("--overwrite", action="store_true",
+                    help="redo files that are already finished")
+    bp.add_argument("--dry-run", action="store_true",
+                    help="list what would run / be re-segmented / be skipped "
+                         "and exit; uploads nothing, creates nothing")
+    bp.add_argument("--jobs", type=int, default=1,
+                    help="parallel uploads (default 1, max 3; the playground "
+                         "is a free shared service - raise with care)")
+    bp.add_argument("--report", default=None,
+                    help="also write a machine-readable JSON report here")
+    bp.add_argument("--keep-conversation", action="store_true", default=None)
+    bp.add_argument("--include-raw", action="store_true")
+    bp.add_argument("--no-llm", action="store_true",
+                    help="skip LLM split-point selection (deterministic only)")
+    _add_tuning(bp)
+
     sv = sub.add_parser("serve", help="run the UI backend API server")
     sv.add_argument("--port", type=int, default=47613)
 
@@ -329,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
         except (TranscribeError, MediaError) as e:
             log.error("run failed: %s", e)
             return 1
+    if args.cmd == "batch":
+        return cmd_batch(cfg, args)
     if args.cmd == "serve":
         return cmd_serve(cfg, args)
     return 2
