@@ -1,0 +1,1 @@
+Linux desktop bundles use the system FFmpeg found on PATH; this file documents the staged resource directory and does not contain FFmpeg binaries. The .deb declares ffmpeg as an install dependency. AppImage users must install ffmpeg using their distribution's package manager before running media jobs.
