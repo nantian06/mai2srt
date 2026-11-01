@@ -32,6 +32,23 @@ class Job:
     result: dict | None = None
     error: str | None = None
     task: asyncio.Task | None = None
+    #: set once the worker has fully wound down (see JobManager.stream)
+    finished: bool = False
+
+    @property
+    def settled(self) -> bool:
+        """Is the job over AND its last word said?
+
+        ``cancel()`` flips ``status`` at once but appends the terminal
+        ``cancelled`` event a moment later (it is marshalled onto the loop).
+        A stream that ended on ``status`` alone could therefore close in
+        between, and the client -- never having seen the terminal event --
+        reconnected a few seconds later and replayed the whole history.
+        """
+        if self.status not in ("done", "error", "cancelled"):
+            return False
+        return self.finished or bool(
+            self.events and self.events[-1]["type"] in ("done", "error", "cancelled"))
 
 
 class JobManager:
@@ -103,6 +120,7 @@ class JobManager:
             log.error("job %s (%s) failed: %s", job.id, job.kind, e)
             self.emit(job, "error", {"message": str(e), "type": type(e).__name__})
         finally:
+            job.finished = True
             self._wake(job)
 
     # -- events ------------------------------------------------------------
@@ -134,12 +152,12 @@ class JobManager:
                 ev = job.events[idx]
                 idx += 1
                 yield ev
-            if job.status in ("done", "error", "cancelled"):
+            if job.settled:
                 return
             waiter = asyncio.Event()
             job._waiters.append(waiter)
             # small race guard: re-check after registering
-            if idx < len(job.events) or job.status in ("done", "error", "cancelled"):
+            if idx < len(job.events) or job.settled:
                 job._waiters.remove(waiter)
                 continue
             await waiter.wait()

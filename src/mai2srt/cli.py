@@ -248,7 +248,7 @@ def cmd_batch(cfg: Config, args: argparse.Namespace) -> int:
             return 1
 
     sp, pp = _tuned_params(args)
-    report = b.BatchReport(items)
+    report = b.BatchReport(items, input_problems=list(problems))
     order = {id(it): n for n, it in enumerate(items, 1)}
     total = len(items)
 

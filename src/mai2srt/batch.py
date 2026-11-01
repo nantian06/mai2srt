@@ -96,6 +96,9 @@ class BatchReport:
     items: list[BatchItem]
     aborted: str | None = None      # global-error message, if the batch stopped
     interrupted: bool = False
+    #: inputs that could not be collected (missing path, empty folder); the
+    #: files that WERE found still run, but the batch is not "ok"
+    input_problems: list[str] = field(default_factory=list)
 
     def count(self, status: str) -> int:
         return sum(1 for i in self.items if i.status == status)
@@ -103,12 +106,13 @@ class BatchReport:
     @property
     def ok(self) -> bool:
         return (self.aborted is None and not self.interrupted
-                and self.count(ST_FAILED) == 0)
+                and not self.input_problems and self.count(ST_FAILED) == 0)
 
     def to_dict(self) -> dict:
         return {
             "ok": self.ok, "aborted": self.aborted,
             "interrupted": self.interrupted,
+            "input_problems": list(self.input_problems),
             "done": self.count(ST_DONE), "skipped": self.count(ST_SKIPPED),
             "failed": self.count(ST_FAILED),
             "cancelled": self.count(ST_CANCELLED),
@@ -199,6 +203,20 @@ def _srt_targets(audios: list[Path], out_dir: Path | None) -> list[Path]:
     return targets
 
 
+def _srt_is_current(srt: Path, transcript: Path) -> bool:
+    """Was this SRT written for (at least) the transcript next to it?
+
+    A run writes the transcript first and the SRT last, so a finished file has
+    an SRT that is not older than its transcript. An older SRT is a leftover
+    from before a re-transcription that then failed or was cancelled between
+    the two writes: counting it as done would skip the file for good.
+    """
+    try:
+        return srt.stat().st_mtime >= transcript.stat().st_mtime
+    except OSError:
+        return False
+
+
 def plan_batch(cfg: Config, audios: list[Path], out_dir: Path | None = None,
                overwrite: bool = False) -> list[BatchItem]:
     """Decide, per file, whether to transcribe, re-segment or skip.
@@ -236,10 +254,12 @@ def plan_batch(cfg: Config, audios: list[Path], out_dir: Path | None = None,
 
         if overwrite:
             action, reason = ACT_TRANSCRIBE, "--overwrite"
-        elif project is not None and srt.exists():
+        elif project is not None and _srt_is_current(srt, project):
             action, reason = ACT_SKIP, "already done (transcript + %s)" % srt.name
         elif project is not None:
-            action, reason = ACT_RESEGMENT, "transcript exists, SRT missing"
+            action, reason = ACT_RESEGMENT, (
+                "transcript exists, SRT missing" if not srt.exists()
+                else "transcript is newer than %s" % srt.name)
         elif srt.exists():
             action, reason = ACT_TRANSCRIBE, "no transcript; will replace existing %s" % srt.name
         else:
@@ -450,6 +470,8 @@ def format_summary(report: BatchReport) -> str:
         sum(1 for i in report.items if i.llm_note)))
     if report.aborted:
         lines.append("ABORTED: " + report.aborted)
+    for msg in report.input_problems:
+        lines.append("INPUT NOT PROCESSED: " + msg)
     if report.interrupted:
         lines.append("INTERRUPTED: finished files are kept; re-run the same "
                      "command to continue (finished files are skipped)")
