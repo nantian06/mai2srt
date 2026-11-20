@@ -1,5 +1,7 @@
 # Packaging and Runtime Design
 
+适用源码基线：`main` / `f3087a19e85da1ef7c0a21bd6e9bf8b2af7591df`（包0.3.0）；版本固定文档与已知历史缺口见[唯一历史入口](changelog.md)。本文是当前打包/播放设计，不是旧版完整架构，也不声明当前机器已部署。
+
 ## Scope
 
 This document describes the desktop packaging boundary. Application behavior and the Python backend API remain unchanged.

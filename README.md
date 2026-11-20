@@ -16,7 +16,7 @@
 
 <br />
 
-**[下载安装包](../../releases/latest)** · [使用方法](#使用方法) · [从源码运行](#从源码运行) · [命令行](#命令行) · [English](README.en.md)
+**[下载安装包](https://github.com/nantian06/mai2srt/releases/latest)** · [使用方法](#使用方法) · [从源码运行](#从源码运行) · [命令行](#命令行) · [English](README.en.md)
 
 <br />
 
@@ -407,6 +407,8 @@ A：OpenAI 兼容、Anthropic、Gemini 三种格式都能用。同一家换个�
 
 mai2srt 以 [GNU 通用公共许可证第 3 版](./LICENSE) 发布。安装包内的第三方组件保留各自许可证，见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
 
+当前开发文档适用于 `main` 的 `f3087a19e85da1ef7c0a21bd6e9bf8b2af7591df` 及后续明确列出的文档修改；软件包版本为0.3.0，tag对应提交另见[唯一版本与设计沿革入口](docs/changelog.md)。[设计](docs/design.md)描述当前打包与播放边界；旧版release notes为历史，不表示当前部署或本次验收。
+
 开发文档：[设计说明](docs/design.md) · [维护日志](docs/changelog.md) · [版本说明](docs/release-notes/v0.3.0.md)。
 
 ---
@@ -421,6 +423,6 @@ Windows 10 / 11 · 转录免费 · 不需要 GPU
 
 <br />
 
-**[下载安装包](../../releases/latest)** · [使用方法](#使用方法) · [回到顶部](#mai2srt)
+**[下载安装包](https://github.com/nantian06/mai2srt/releases/latest)** · [使用方法](#使用方法) · [回到顶部](#mai2srt)
 
 </div>
