@@ -340,8 +340,10 @@ def test_context_budget_clamp():
     big = LLMEndpoint(context_window=1_000_000)
     none_meta = LLMEndpoint()
     assert small.budget_chars() == max(2_000, int(8_000 * 0.4 / 0.6))
-    assert big.budget_chars() == 40_000
-    assert none_meta.budget_chars() == 40_000
+    assert big.budget_chars() == 6_000
+    assert none_meta.budget_chars() == 6_000
+    assert none_meta.input_budget_chars() == 40_000
+    assert LLMEndpoint(max_output=1_200).budget_chars() == 1_000
 
 
 def test_output_budget_clamps_batching():
@@ -350,23 +352,23 @@ def test_output_budget_clamps_batching():
     # declared 8K output -> 4096-token budget -> ~6.8K chars, ~102 tasks
     small = LLMEndpoint(max_output=8_192)
     assert small.output_budget_tokens() == 4_096
-    assert small.budget_chars() == int(4_096 / 0.6)
+    assert small.budget_chars() == 6_000
     assert small.budget_tasks() == 4_096 // 40
     # unknown metadata: the smallest published vendor ceiling (64K) applies,
-    # so the 40K blast-radius cap is what actually binds
+    # so the 6K batch cap is what actually binds
     unknown = LLMEndpoint()
     assert unknown.output_budget_tokens() == 32_000
-    assert unknown.budget_chars() == 40_000
+    assert unknown.budget_chars() == 6_000
     assert unknown.budget_tasks() == 800
     # a huge declared output cannot lift the blast-radius cap either
-    assert LLMEndpoint(max_output=524_288).budget_chars() == 40_000
+    assert LLMEndpoint(max_output=524_288).budget_chars() == 6_000
     # context window still wins when it is the smaller of the two
     assert LLMEndpoint(context_window=8_000, max_output=524_288
                        ).budget_chars() == int(8_000 * 0.4 / 0.6)
 
 
 def test_batching_is_char_bound_not_task_count():
-    e = LLMEndpoint()                       # 40_000 chars, 800 tasks
+    e = LLMEndpoint()                       # 6_000 chars, 800 tasks
     sp = ProtocolSplitter(e)
 
     def task(rid, n):
@@ -374,11 +376,11 @@ def test_batching_is_char_bound_not_task_count():
         return SplitTask(rid, words, [Candidate(0, "punct_comma")])
 
     big = [task(i, 62) for i in range(300)]          # 18_600 chars in total
-    assert len(sp._batches(big)) == 1                # used to be 15 at 20/request
+    assert len(sp._batches(big)) == 4
     # ... while the scaffolding budget still guards thousands of tiny runs
     tiny = [task(i, 20) for i in range(1_000)]       # 20_000 chars, 1_000 ids
     batches = sp._batches(tiny)
-    assert len(batches) == 2
+    assert len(batches) == 4
     assert all(len(b) <= e.budget_tasks() for b in batches)
 
 
@@ -470,6 +472,21 @@ def test_ui_source_contains_no_emoji():
             for m in _EMOJI_RE.finditer(text):
                 hits.append((f.name, m.start(), m.group()))
     assert hits == [], "emoji found in UI source: %r" % hits[:5]
+
+
+def test_resolve_endpoint_timeout_precedence():
+    provider = {"id": "p", "timeout_s": 75}
+    cfg = {"llm_active": {"provider": "p"},
+           "llm_providers": [provider], "llm": {"timeout_s": 250}}
+    assert resolve_endpoint(cfg).timeout_s == 75
+    for invalid in (None, True, "invalid", -1, 0, float("nan"), float("inf")):
+        provider["timeout_s"] = invalid
+        assert resolve_endpoint(cfg).timeout_s == 250
+    provider["timeout_s"] = 1
+    assert resolve_endpoint(cfg).timeout_s == 10
+    provider["timeout_s"] = 2000
+    assert resolve_endpoint(cfg).timeout_s == 1800
+    assert resolve_endpoint({"llm": {"timeout_s": False}}).timeout_s == 120
 
 
 if __name__ == "__main__":

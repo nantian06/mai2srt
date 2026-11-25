@@ -16,7 +16,7 @@ from ..config import (
     SILENCE_MIN_S,
     SILENCE_NOISE_DB,
 )
-from .compress import mp3_bitrate_bps
+from .compress import UploadSizeError, compress_for_upload, mp3_bitrate_bps
 from .probe import MediaError, MediaInfo, resolve_tool, run_tool
 
 log = logging.getLogger("mai2srt.media")
@@ -35,7 +35,7 @@ class ChunkPlan:
 
 
 def detect_silences(src: Path) -> list[float]:
-    """Timestamps (seconds) where a >=SILENCE_MIN_S silence ENDS."""
+    """Timestamps (seconds) at the midpoint of each detected silence."""
     ffmpeg = resolve_tool("ffmpeg")
     # -vn: the scan needs AUDIO only. Without it a video source decodes
     # its whole picture stream too -- a 69-min video spent 11.5 min in
@@ -47,13 +47,14 @@ def detect_silences(src: Path) -> list[float]:
         capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=7200,
     )
-    ends = [float(m.group(1)) for m in _SILENCE_END_RE.finditer(r.stderr or "")]
-    if not ends and r.returncode != 0:
+    midpoints = [max(0.0, float(m[1]) - float(m[2]) / 2)
+                 for m in _SILENCE_END_RE.finditer(r.stderr or "")]
+    if not midpoints and r.returncode != 0:
         raise MediaError(
             f"silencedetect failed (rc={r.returncode}): "
             f"{(r.stderr or '')[-300:]}")
-    log.info("detected %d silence points", len(ends))
-    return ends
+    log.info("detected %d silence points", len(midpoints))
+    return midpoints
 
 
 def plan_chunks(duration_s: float, silences: list[float],
@@ -65,8 +66,9 @@ def plan_chunks(duration_s: float, silences: list[float],
     start = 0.0
     while duration_s - start > target_s:
         boundary = start + target_s
-        window = [t for t in silences if start + 5.0 < t <= boundary]
-        cut = window[-1] if window else boundary
+        window_start = max(start + 5.0, boundary - min(180.0, target_s * 0.2))
+        cut = max((t for t in silences if window_start <= t <= boundary),
+                  default=boundary)
         pieces.append((start, cut))
         start = cut
     pieces.append((start, duration_s))
@@ -77,9 +79,8 @@ def plan_chunks(duration_s: float, silences: list[float],
 
 def cut_chunk(src: Path, dst: Path, start_s: float, end_s: float) -> Path:
     """Encode one chunk to mp3 sized for the upload budget."""
-    from .compress import encode_mp3  # local import avoids cycle at module load
-    bitrate = mp3_bitrate_bps(end_s - start_s)
-    return encode_mp3(src, dst, bitrate, start_s=start_s, end_s=end_s)
+    return compress_for_upload(src, dst, end_s - start_s,
+                               start_s=start_s, end_s=end_s)
 
 
 def prepare(audio: Path, info: MediaInfo, workdir: Path,
@@ -121,21 +122,33 @@ def prepare(audio: Path, info: MediaInfo, workdir: Path,
             len(plan.pieces),
             ", ".join("%.0f min" % ((e - s) / 60) for s, e in plan.pieces)))
         out: list[tuple[Path, float]] = []
-        for i, (s, e) in enumerate(plan.pieces):
-            p("encoding chunk %d/%d (%.0f min)" % (
-                i + 1, len(plan.pieces), (e - s) / 60))
-            dst = workdir / f"{stem}.chunk{i:02d}.mp3"
-            cut_chunk(audio, dst, s, e)
-            size = dst.stat().st_size
-            if size > MAX_UPLOAD_BYTES:
-                raise MediaError(
-                    f"chunk {i} is {size / 1024 / 1024:.1f} MiB after "
-                    "compression; lower CHUNK_TARGET_SECONDS")
+        def encode_piece(dst: Path, s: float, e: float, label: str,
+                         depth: int = 0) -> None:
+            try:
+                cut_chunk(audio, dst, s, e)
+                size = dst.stat().st_size
+                if size > MAX_UPLOAD_BYTES:
+                    raise UploadSizeError(label, e - s, size, mp3_bitrate_bps(e - s))
+            except UploadSizeError as exc:
+                if e - s <= 60.0 or depth >= 2:
+                    raise UploadSizeError(label, e - s, exc.size, exc.bitrate) from exc
+                mid = (s + e) / 2
+                msg = f"{label} exceeds upload limit, splitting at {mid:.1f}s"
+                log.info("%s", msg)
+                p(msg)
+                for part, left, right in ((1, s, mid), (2, mid, e)):
+                    child = dst.with_name(f"{dst.stem}-{part}.mp3")
+                    encode_piece(child, left, right, f"{label}.{part}", depth + 1)
+                return
             out.append((dst, s))
-            p("chunk %d/%d ready (%.1f MiB)" % (
-                i + 1, len(plan.pieces), size / 1024 / 1024))
-            log.info("chunk %d: %.1fs..%.1fs -> %s (%.1f MiB)",
-                     i, s, e, dst.name, size / 1024 / 1024)
+            p(f"{label} ready ({size / 2**20:.1f} MiB)")
+            log.info("%s: %.1fs..%.1fs -> %s (%.1f MiB)",
+                     label, s, e, dst.name, size / 2**20)
+
+        for i, (s, e) in enumerate(plan.pieces):
+            label = f"chunk {i + 1}/{len(plan.pieces)}"
+            p(f"encoding {label} ({(e - s) / 60:.0f} min)")
+            encode_piece(workdir / f"{stem}.chunk{i:02d}.mp3", s, e, label)
         return out
 
     if info.mime and info.size_bytes <= MAX_UPLOAD_BYTES:
@@ -144,6 +157,5 @@ def prepare(audio: Path, info: MediaInfo, workdir: Path,
 
     p("compressing to mp3 for upload")
     dst = workdir / f"{stem}.upload.mp3"
-    from .compress import compress_for_upload
     compress_for_upload(audio, dst, info.duration_s)
     return [(dst, 0.0)]

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
-  Brain, CheckCircle2, Eye, KeyRound, Layers, Loader2, Plus, RefreshCw, Server, Trash2,
+  Brain, CheckCircle2, Clock, Eye, KeyRound, Layers, Loader2, Plus, RefreshCw, Server, Trash2,
   Zap,
 } from 'lucide-react';
 import {
@@ -223,6 +223,21 @@ export function LlmSettings() {
   );
 }
 
+/* --------------------------------------------------------- timeout parsing */
+
+const TIMEOUT_MIN_S = 10;
+const TIMEOUT_MAX_S = 1800;
+
+function parseTimeoutInput(raw: string): { ok: true; value: number | null } | { ok: false } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { ok: true, value: null };
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n < TIMEOUT_MIN_S || n > TIMEOUT_MAX_S) {
+    return { ok: false };
+  }
+  return { ok: true, value: n };
+}
+
 /* ------------------------------------------------------------ add provider */
 
 function AddProviderCard({
@@ -236,9 +251,11 @@ function AddProviderCard({
   const [name, setName] = useState('DeepSeek 官方');
   const [baseUrl, setBaseUrl] = useState('https://api.deepseek.com');
   const [apiKey, setApiKey] = useState('');
+  const [timeoutText, setTimeoutText] = useState('');
   const [protocol, setProtocol] = useState<'openai' | 'anthropic' | 'gemini'>('openai');
   const { t, tf } = useI18n();
   const toast = useToast();
+  const parsedTimeout = parseTimeoutInput(timeoutText);
 
   function pickPreset(id: string) {
     setPresetId(id);
@@ -267,6 +284,10 @@ function AddProviderCard({
   }
 
   async function save() {
+    if (!parsedTimeout.ok) {
+      toast('error', t('s.timeout.invalid'));
+      return;
+    }
     const preset = presets[presetId];
     // auth style follows the PROTOCOL, not the preset: switching a preset
     // to a non-default format (e.g. Gemini's openai-compat) must not carry
@@ -278,16 +299,20 @@ function AddProviderCard({
       : protocol === 'gemini' ? 'query-key'
       : preset?.auth_style === 'none' ? 'none'
       : 'bearer';
+    const payload: Partial<Provider> & { id?: string } = {
+      id: presetId === 'custom' ? undefined : presetId,
+      name,
+      protocol,
+      base_url: baseUrl,
+      api_key: apiKey || '***',
+      auth_style: authStyle,
+      models: [],
+    };
+    if (parsedTimeout.value !== null) {
+      payload.timeout_s = parsedTimeout.value;
+    }
     try {
-      await llmSaveProvider({
-        id: presetId === 'custom' ? undefined : presetId,
-        name,
-        protocol,
-        base_url: baseUrl,
-        api_key: apiKey || '***',
-        auth_style: authStyle,
-        models: [],
-      });
+      await llmSaveProvider(payload);
       toast('ok', tf('s.toast.providerSaved', { name }));
       onSaved();
     } catch (e) {
@@ -345,9 +370,22 @@ function AddProviderCard({
           placeholder="sk-..."
           onChange={(e) => setApiKey(e.target.value)}
         />
+        <Field
+          label={t('s.f.timeout')}
+          type="number"
+          min={TIMEOUT_MIN_S}
+          max={TIMEOUT_MAX_S}
+          step="any"
+          inputMode="decimal"
+          value={timeoutText}
+          placeholder={t('s.f.timeoutPlaceholder')}
+          hint={parsedTimeout.ok ? t('s.f.timeoutHint') : t('s.timeout.invalid')}
+          className={parsedTimeout.ok ? '' : 'border-err'}
+          onChange={(e) => setTimeoutText(e.target.value)}
+        />
       </div>
       <div className="flex gap-2">
-        <Button onClick={save} disabled={!name || !baseUrl}>
+        <Button onClick={save} disabled={!name || !baseUrl || !parsedTimeout.ok}>
           <KeyRound size={14} strokeWidth={2} /> {t('s.saveProvider')}
         </Button>
         <Button variant="ghost" onClick={onCancel}>{t('s.cancel')}</Button>
@@ -369,9 +407,16 @@ function ProviderCard({
   const [busy, setBusy] = useState<'test' | 'discover' | null>(null);
   // per-row model test, holds the model id being pinged (null = idle)
   const [testing, setTesting] = useState<string | null>(null);
+  const [timeoutDraft, setTimeoutDraft] = useState<string | null>(null);
+  const [savingTimeout, setSavingTimeout] = useState(false);
   const { t, tf } = useI18n();
   const toast = useToast();
   const isActive = active?.provider === provider.id;
+
+  const savedTimeout = provider.timeout_s ?? null;
+  const timeoutText = timeoutDraft ?? (savedTimeout != null ? String(savedTimeout) : '');
+  const parsedTimeout = parseTimeoutInput(timeoutText);
+  const timeoutDirty = parsedTimeout.ok ? parsedTimeout.value !== savedTimeout : true;
 
   // The card-level button tests the model you actually transcribe with when
   // this provider is the active one -- but only while it still exists in the
@@ -442,6 +487,36 @@ function ProviderCard({
     }
   }
 
+  async function saveTimeout() {
+    if (!parsedTimeout.ok) {
+      toast('error', t('s.timeout.invalid'));
+      return;
+    }
+    setSavingTimeout(true);
+    try {
+      await llmSaveProvider({
+        id: provider.id,
+        name: provider.name,
+        protocol: provider.protocol,
+        base_url: provider.base_url,
+        api_key: provider.api_key || '***',
+        auth_style: provider.auth_style,
+        models: provider.models,
+        timeout_s: parsedTimeout.value,
+      });
+      const label = parsedTimeout.value != null
+        ? tf('s.timeout.seconds', { n: parsedTimeout.value })
+        : t('s.timeout.defaultVal');
+      toast('ok', tf('s.timeout.saved', { name: provider.name, value: label }));
+      setTimeoutDraft(null);
+      onChanged();
+    } catch (e) {
+      toast('error', String(e).slice(0, 160));
+    } finally {
+      setSavingTimeout(false);
+    }
+  }
+
   return (
     <Card className="flex flex-col p-5">
       <div className="flex items-center gap-3">
@@ -458,6 +533,7 @@ function ProviderCard({
             </p>
             <p className="truncate font-mono text-[10.5px] text-ink-3">
               {provider.protocol} · {provider.base_url} · {tf('s.modelsCount', { n: provider.models.length })}
+              {provider.timeout_s != null && ` · ${provider.timeout_s}s`}
             </p>
           </div>
         </button>
@@ -495,6 +571,45 @@ function ProviderCard({
             className="overflow-hidden"
           >
             <div className="mt-4 border-t border-line-1 pt-3">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-3 border-b border-line-1 pb-3">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Clock size={14} strokeWidth={2} className="shrink-0 text-ink-3" />
+                  <span className="text-[12px] font-medium text-ink-2">{t('s.f.timeout')}</span>
+                  <span className={`text-[11px] ${parsedTimeout.ok ? 'text-ink-3' : 'text-err'}`}>
+                    {parsedTimeout.ok ? t('s.f.timeoutHint') : t('s.timeout.invalid')}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={TIMEOUT_MIN_S}
+                    max={TIMEOUT_MAX_S}
+                    step="any"
+                    inputMode="decimal"
+                    value={timeoutText}
+                    placeholder={t('s.f.timeoutPlaceholder')}
+                    aria-label={t('s.f.timeout')}
+                    onChange={(e) => setTimeoutDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && timeoutDirty && parsedTimeout.ok && !savingTimeout) {
+                        void saveTimeout();
+                      }
+                    }}
+                    className={`glass-input h-8 w-28 px-2.5 font-mono text-[12px] text-ink-1 placeholder:text-ink-3 ${
+                      parsedTimeout.ok ? '' : 'border-err'
+                    }`}
+                  />
+                  <Button
+                    variant="ghost"
+                    className="h-8 px-3 text-[12px]"
+                    busy={savingTimeout}
+                    disabled={!timeoutDirty || !parsedTimeout.ok}
+                    onClick={saveTimeout}
+                  >
+                    {t('s.timeout.save')}
+                  </Button>
+                </div>
+              </div>
               {provider.models.length === 0 && (
                 <p className="py-3 text-[12.5px] text-ink-3">
                   {t('s.noModels')}

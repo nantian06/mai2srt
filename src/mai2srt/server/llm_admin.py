@@ -15,7 +15,7 @@ from pathlib import Path
 
 from ..config import Config, load_app_config, save_app_config
 from ..net import USER_AGENT
-from ..segment.llm import LLMEndpoint, _build_request, _content, _openai_path
+from ..segment.llm import LLMEndpoint, _build_request, _content, _openai_path, _parse_timeout_s
 
 PROTOCOLS = ("openai", "anthropic", "gemini")
 AUTH_STYLES = ("bearer", "x-api-key", "query-key", "none")
@@ -195,7 +195,8 @@ def provider_public(p: dict) -> dict:
 
 
 def upsert_provider(cfg: Config, provider: dict) -> dict:
-    providers = load_providers(cfg)
+    data = load_app_config(cfg)
+    providers = data.setdefault("llm_providers", [])
     pid = provider.get("id") or provider["name"].lower().replace(" ", "-")
     provider = dict(provider)
     provider["id"] = pid
@@ -204,13 +205,25 @@ def upsert_provider(cfg: Config, provider: dict) -> dict:
         if existing["id"] == pid:
             if not provider.get("api_key") or provider["api_key"] == "***":
                 provider["api_key"] = existing.get("api_key", "")
+            if "timeout_s" not in provider and "timeout_s" in existing:
+                provider["timeout_s"] = existing["timeout_s"]
             providers[i] = provider
             break
     else:
         if not provider.get("api_key"):
             provider["api_key"] = ""
         providers.append(provider)
-    save_providers(cfg, providers)
+    if provider.get("timeout_s") is None:
+        provider.pop("timeout_s", None)
+    legacy = data.get("llm")
+    if ((data.get("llm_active") or {}).get("provider") == pid
+            and provider.get("protocol") == "openai" and isinstance(legacy, dict)):
+        timeout = _parse_timeout_s(provider.get("timeout_s"), 0.0)
+        if timeout:
+            legacy["timeout_s"] = timeout
+        else:
+            legacy.pop("timeout_s", None)
+    save_app_config(cfg, data)
     return provider
 
 
@@ -244,6 +257,9 @@ def set_active(cfg: Config, active: dict) -> dict:
             "model": active.get("model", ""),
             "temperature": 0.0,
         }
+        timeout = _parse_timeout_s(p.get("timeout_s"), 0.0)
+        if timeout:
+            data["llm"]["timeout_s"] = timeout
         if model and model.get("context_window"):
             data["llm"]["context_window"] = model["context_window"]
     save_app_config(cfg, data)
@@ -333,7 +349,7 @@ def diff_models(existing: list[dict], discovered: list[dict]) -> dict:
 
 
 def test_provider(provider: dict, model_id: str | None = None,
-                  effort: str | None = None, timeout: float = 60.0) -> dict:
+                  effort: str | None = None, timeout: float | None = None) -> dict:
     """Minimal chat ping to verify credentials + model availability.
 
     Built by the SAME request builder as the real segmentation calls --
@@ -360,6 +376,8 @@ def test_provider(provider: dict, model_id: str | None = None,
     url, payload, headers = _build_request(
         endpoint, "You are a connectivity probe. Reply with: pong", "ping")
 
+    if timeout is None:
+        timeout = _parse_timeout_s(provider.get("timeout_s"), 60.0)
     body = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:

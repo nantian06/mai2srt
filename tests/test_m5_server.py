@@ -234,6 +234,81 @@ def test_job_manager_error_capture():
     asyncio.run(run())
 
 
+def test_provider_timeout_put_and_mirror(tmp_path):
+    import json
+    from mai2srt.config import load_app_config
+    from mai2srt.segment.llm import resolve_endpoint
+    from mai2srt.server.app import create_app
+
+    cfg = _cfg(tmp_path)
+    app = create_app(cfg)
+
+    async def send_put(body):
+        messages = []
+
+        async def receive():
+            return {"type": "http.request", "body": body.encode()}
+
+        async def send(message):
+            messages.append(message)
+
+        await app({"type": "http", "method": "PUT", "path": "/api/llm/providers",
+                   "headers": [(b"content-type", b"application/json")],
+                   "query_string": b"", "scheme": "http"}, receive, send)
+        return messages[0]["status"], json.loads(messages[1]["body"])
+
+    def put(body):
+        return asyncio.run(send_put(body))
+    provider = {"id": "p", "name": "P"}
+    for invalid in (5, 9.9, 1801, True, "120", 0, -1, float("nan"), float("inf")):
+        status, error = put(json.dumps({**provider, "timeout_s": invalid}))
+        assert status == 400
+        assert error["detail"] == "timeout_s must be between 10 and 1800 seconds"
+    for boundary in (10, 1800):
+        status, saved = put(json.dumps({**provider, "timeout_s": boundary}))
+        assert status == 200
+        assert saved["provider"]["timeout_s"] == boundary
+    status, saved = put(json.dumps({**provider, "timeout_s": 90}))
+    assert status == 200
+    assert saved["provider"]["timeout_s"] == 90
+    assert put(json.dumps(provider))[1]["provider"]["timeout_s"] == 90
+    llm_admin.set_active(cfg, {"provider": "p", "model": "m"})
+    assert load_app_config(cfg)["llm"]["timeout_s"] == 90
+    status, saved = put(json.dumps({**provider, "timeout_s": 240}))
+    assert status == 200
+    assert saved["provider"]["timeout_s"] == 240
+    assert load_app_config(cfg)["llm"]["timeout_s"] == 240
+    status, saved = put(json.dumps({**provider, "timeout_s": None}))
+    assert status == 200
+    assert "timeout_s" not in saved["provider"]
+    data = load_app_config(cfg)
+    assert "timeout_s" not in data["llm_providers"][0]
+    assert "timeout_s" not in data["llm"]
+    assert resolve_endpoint(data).timeout_s == 120.0
+    assert put(json.dumps({**provider, "timeout_s": 90}))[0] == 200
+    # switching to another provider without timeout_s must not inherit p's 90s
+    assert put(json.dumps({"id": "p2", "name": "P2"}))[0] == 200
+    llm_admin.set_active(cfg, {"provider": "p2", "model": "m2"})
+    assert "timeout_s" not in load_app_config(cfg)["llm"]
+
+
+def test_provider_connectivity_timeout():
+    from io import BytesIO
+    from unittest.mock import patch
+
+    provider = {"protocol": "openai", "base_url": "https://example.com",
+                "models": [{"id": "m"}]}
+    for overrides, kwargs, expected in (
+        ({"timeout_s": 240}, {}, 240.0),
+        ({}, {}, 60.0),
+        ({"timeout_s": 240}, {"timeout": 15.0}, 15.0),
+    ):
+        response = BytesIO(b'{"choices":[{"message":{"content":"pong"}}]}')
+        with patch.object(llm_admin.urllib.request, "urlopen", return_value=response) as urlopen:
+            assert llm_admin.test_provider({**provider, **overrides}, **kwargs)["ok"]
+            assert urlopen.call_args.kwargs["timeout"] == expected
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

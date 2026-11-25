@@ -451,6 +451,8 @@ export interface Provider {
   api_key: string; // masked as "***" in responses
   auth_style: string;
   models: ModelMeta[];
+  /** per-request HTTP timeout in seconds (10-1800); omitted = 120s default */
+  timeout_s?: number | null;
 }
 
 export interface ActiveLLM {

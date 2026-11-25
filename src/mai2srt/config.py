@@ -27,7 +27,8 @@ ACCEPTED_MIMES = {"mp3": "audio/mpeg", "wav": "audio/wav"}
 #: compression target sits under the limit (mp3 container overhead)
 COMPRESS_TARGET_BYTES = 23 * 1024 * 1024
 MP3_BITRATE_MIN_BPS = 64_000
-MP3_BITRATE_MAX_BPS = 192_000
+MP3_BITRATE_MAX_BPS = 128_000
+MP3_STANDARD_BITRATES_BPS = (64_000, 80_000, 96_000, 112_000, 128_000, 160_000, 192_000)
 
 #: longest audio sent as ONE upload (still under the site's 3615s gate).
 #: 2026-10-13 incident: a 2h lecture split into ~50-min chunks got a

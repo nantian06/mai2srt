@@ -392,8 +392,7 @@ def test_output_cap_rejection_retries_without_and_shrinks(monkeypatch):
     assert caps[0] and caps[1] is None          # asked, refused, retried bare
     assert [join_words(pc) for pc in out[1]] == [text]    # still succeeded
     assert any("端点不接受生成上限参数" in m for m in logs)
-    assert sp._cap_chars == int(llm._ASSUMED_DEFAULT_OUTPUT_TOKENS
-                                * llm._OUTPUT_SAFETY / llm._CHARS_PER_TOKEN)
+    assert sp._cap_chars == 3_000
     # the tighter ceiling now governs packing
     many = [_task(i, "あ" * 61 + "。") for i in range(300)]
     batches = sp._batches(many)
@@ -421,9 +420,9 @@ def test_every_batch_and_the_total_are_logged(monkeypatch):
     out = sp.choose(tasks, SegmentParams())
 
     assert len(out) == 700
-    assert any("断句：700 段，分 2 批" in m for m in logs)
-    assert any("断句批次 1/2" in m for m in logs)
-    assert any("断句批次 2/2" in m for m in logs)
+    assert any("断句：700 段，分 8 批" in m for m in logs)
+    assert any("断句批次 1/8" in m for m in logs)
+    assert any("断句批次 8/8" in m for m in logs)
     assert any(m.startswith("断句完成：700/700") for m in logs)
 
 
@@ -536,3 +535,40 @@ def test_unaligned_run_still_degrades_after_retries(monkeypatch):
     monkeypatch.setattr(llm, "_request", fake_request)
     out = sp.choose([_task(1), _task(2)], SegmentParams())
     assert list(out) == [1]                     # 2 never aligned -> upstream fallback
+
+
+def test_timeout_splits_immediately_and_repacks_later_batches(monkeypatch):
+    sp = ProtocolSplitter(LLMEndpoint())
+    calls = []
+
+    def request(endpoint, system, user, **kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        calls.append([rid for rid, _ in _blocks(user)])
+        if len(calls) == 1:
+            raise LLMSplitError("HTTP 504 from x")
+        return _echo(user)
+
+    monkeypatch.setattr(llm, "_request", request)
+    tasks = [_task(i, "あ" * 1500) for i in range(8)]
+    assert set(sp.choose(tasks, SegmentParams())) == set(range(8))
+    assert calls == [[0, 1, 2, 3], [0, 1], [2, 3], [4, 5], [6, 7]]
+    assert sp._cap_chars == 3000
+
+
+def test_single_segment_timeout_retries(monkeypatch):
+    sp = ProtocolSplitter(LLMEndpoint())
+    calls = []
+
+    def request(endpoint, system, user, **kw):
+        if system == llm._SUMMARY_SYSTEM_PROMPT:
+            return "摘要。"
+        calls.append(user)
+        if len(calls) < 3:
+            raise LLMSplitError("请求超时")
+        return _echo(user)
+
+    monkeypatch.setattr(llm, "_request", request)
+    monkeypatch.setattr(llm.time, "sleep", lambda _: None)
+    assert set(sp.choose([_task(0)], SegmentParams())) == {0}
+    assert len(calls) == 3

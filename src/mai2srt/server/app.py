@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from .. import __version__
 from ..config import (
@@ -23,6 +23,7 @@ from ..config import (
 )
 from ..postprocess import PostprocessParams
 from ..segment import SegmentParams
+from ..segment.llm import LLM_TIMEOUT_MAX_S, LLM_TIMEOUT_MIN_S
 from ..media import playback
 from ..storage import paired_edit_path
 from ..transcribe.persist import load_mai_json
@@ -43,6 +44,17 @@ class ProviderIn(BaseModel):
     api_key: str = ""
     auth_style: str = "bearer"
     models: list[dict] = []
+    timeout_s: float | None = None
+
+    @field_validator("timeout_s", mode="before")
+    @classmethod
+    def validate_timeout_s(cls, value):
+        if value is None:
+            return None
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not LLM_TIMEOUT_MIN_S <= value <= LLM_TIMEOUT_MAX_S):
+            raise HTTPException(400, "timeout_s must be between 10 and 1800 seconds")
+        return value
 
 
 class DiscoverApplyIn(BaseModel):
@@ -358,7 +370,10 @@ def create_app(cfg: Config) -> FastAPI:
     def llm_put_provider(p: ProviderIn) -> dict:
         if p.protocol not in llm_admin.PROTOCOLS:
             raise HTTPException(400, "unknown protocol")
-        saved = llm_admin.upsert_provider(cfg, p.model_dump())
+        provider = p.model_dump()
+        if "timeout_s" not in p.model_fields_set:
+            provider.pop("timeout_s", None)
+        saved = llm_admin.upsert_provider(cfg, provider)
         return {"provider": llm_admin.provider_public(saved)}
 
     @app.delete("/api/llm/providers/{pid}")

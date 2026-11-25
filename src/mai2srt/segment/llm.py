@@ -33,6 +33,7 @@ remembered, and the batches shrink to a known-safe ceiling instead of failing.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 import unicodedata
@@ -50,6 +51,7 @@ from .rules import SegmentParams, _needs_space, join_words
 #: batch guards -- the char ceiling is the blast-radius cap (one request that
 #: drifts loses every run inside it), the rest is derived from the model.
 _MAX_MARKED_CHARS_PER_REQUEST = 40_000
+_MAX_BATCH_CHARS_PER_REQUEST = 6_000
 
 #: generation ceiling assumed when the endpoint's model metadata is unknown:
 #: the SMALLEST published max-output among the current flagships and fast
@@ -179,6 +181,11 @@ _CHARS_PER_TOKEN = 0.6
 # endpoint description
 # ---------------------------------------------------------------------------
 
+LLM_TIMEOUT_MIN_S = 10.0
+LLM_TIMEOUT_MAX_S = 1800.0
+LLM_TIMEOUT_DEFAULT_S = 120.0
+
+
 @dataclass
 class LLMEndpoint:
     """One fully-resolved endpoint: provider row + model meta + effort."""
@@ -197,13 +204,13 @@ class LLMEndpoint:
     context_window: int | None = None     # tokens
     max_output: int | None = None         # tokens
     temperature: float = 0.0
-    timeout_s: float = 120.0
+    timeout_s: float = LLM_TIMEOUT_DEFAULT_S
 
     @classmethod
     def from_legacy(cls, cfg: LLMConfig) -> "LLMEndpoint":
         return cls(protocol="openai", base_url=cfg.base_url, api_key=cfg.api_key,
                    model=cfg.model, temperature=cfg.temperature,
-                   timeout_s=cfg.timeout_s)
+                   timeout_s=_parse_timeout_s(cfg.timeout_s))
 
     def output_budget_tokens(self) -> int:
         """Generation tokens one batch may ask the model to produce."""
@@ -230,7 +237,8 @@ class LLMEndpoint:
         whichever is smaller wins.
         """
         out_chars = int(self.output_budget_tokens() / _CHARS_PER_TOKEN)
-        return min(self.input_budget_chars(), max(2_000, out_chars))
+        return min(_MAX_BATCH_CHARS_PER_REQUEST, self.input_budget_chars(),
+                   max(1, out_chars))
 
     def budget_tasks(self) -> int:
         """How many [id=N] blocks fit the output budget's scaffolding alone.
@@ -373,6 +381,11 @@ class LLMSplitError(RuntimeError):
     pass
 
 
+def _is_timeout_error(err: str) -> bool:
+    return bool(re.search(r"timeout|timed out|超时|HTTP (?:408|504)\b",
+                          err, re.IGNORECASE))
+
+
 def _is_retryable_error(err: str) -> bool:
     """Retry policy (M6d): transport errors (timeout/connection) and parse
     failures retry with backoff; auth-class 4xx fails fast; other HTTP
@@ -384,7 +397,7 @@ def _is_retryable_error(err: str) -> bool:
             return False
         return code in _RETRYABLE_HTTP
     low = (err or "").lower()
-    return any(k in low for k in _RETRYABLE_KEYWORDS)
+    return _is_timeout_error(low) or any(k in low for k in _RETRYABLE_KEYWORDS)
 
 
 def _is_output_cap_rejection(err: str) -> bool:
@@ -797,10 +810,22 @@ class ProtocolSplitter:
 
     def _run_batch(self, batch: list[SplitTask], params: SegmentParams,
                    summary: str, errors: list[str]) -> dict[int, list[int]]:
+        if self._cap_chars is not None and len(batch) > 1:
+            smaller = self._batches(batch)
+            if len(smaller) > 1:
+                out = {}
+                for piece in smaller:
+                    out.update(self._run_batch(piece, params, summary, errors))
+                return out
         try:
             return self._choose_batch(batch, params, summary)
         except LLMSplitError as e:
             if len(batch) > 1:
+                if _is_timeout_error(str(e)):
+                    batch_chars = sum(len(join_words(t.words)) for t in batch)
+                    self._cap_chars = min(self._cap_chars or batch_chars,
+                                          max(1_500, batch_chars // 2))
+                    self._log("断句超时，后续分批上限收紧到 %d 字" % self._cap_chars)
                 mid = len(batch) // 2
                 self._log("批 %d 段失败（%s），对半拆分重试" % (len(batch), e))
                 out = self._run_batch(batch[:mid], params, summary, errors)
@@ -913,6 +938,9 @@ class ProtocolSplitter:
                 continue
             except LLMSplitError as e:
                 msg = str(e)
+                if _is_timeout_error(msg) and len(pending) > 1 and not out:
+                    self._log("多段断句请求超时，交由拆批重试")
+                    raise
                 # thinking-form rejection first (its message can also name
                 # max_tokens, which would misfire the cap fallback below)
                 if self.e.protocol == "anthropic":
@@ -951,9 +979,13 @@ class ProtocolSplitter:
                     # platform default is known to cover. Immediate retry --
                     # this is not a failure, just an unsupported parameter.
                     self._send_cap = False
-                    self._cap_chars = max(
+                    fallback_cap = max(
                         2_000, int(_ASSUMED_DEFAULT_OUTPUT_TOKENS
                                    * _OUTPUT_SAFETY / _CHARS_PER_TOKEN))
+                    # The fixed split ceiling can already be below the
+                    # assumed default, so also reduce the current budget.
+                    fallback_cap = min(fallback_cap, max(1, self.e.budget_chars() // 2))
+                    self._cap_chars = min(self._cap_chars or fallback_cap, fallback_cap)
                     cap = None
                     self._log("端点不接受生成上限参数（%s），已改为不发送并"
                               "把分批收紧到 %d 字" % (msg[:80], self._cap_chars))
@@ -999,8 +1031,22 @@ class OpenAICompatibleSplitter(ProtocolSplitter):
         super().__init__(LLMEndpoint.from_legacy(cfg), log=log)
 
 
+def _parse_timeout_s(val: object, default: float = LLM_TIMEOUT_DEFAULT_S) -> float:
+    if isinstance(val, bool):
+        return default
+    try:
+        seconds = float(val)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(seconds) or seconds <= 0:
+        return default
+    return min(LLM_TIMEOUT_MAX_S, max(LLM_TIMEOUT_MIN_S, seconds))
+
+
 def resolve_endpoint(app_config: dict) -> LLMEndpoint:
     """Active endpoint from llm_active (+ provider/model meta), legacy fallback."""
+    legacy = app_config.get("llm") or {}
+    legacy_timeout = _parse_timeout_s(legacy.get("timeout_s")) if isinstance(legacy, dict) else LLM_TIMEOUT_DEFAULT_S
     active = app_config.get("llm_active") or {}
     providers = {p.get("id"): p for p in app_config.get("llm_providers", [])}
     pid = active.get("provider")
@@ -1016,6 +1062,7 @@ def resolve_endpoint(app_config: dict) -> LLMEndpoint:
             effort=active.get("effort"),
             context_window=m.get("context_window"),
             max_output=m.get("max_output"),
+            timeout_s=_parse_timeout_s(p.get("timeout_s"), legacy_timeout),
         )
     from ..config import llm_config_from
     return LLMEndpoint.from_legacy(llm_config_from(app_config))
